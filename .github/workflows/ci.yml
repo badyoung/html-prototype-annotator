@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install devDependencies
+        run: npm ci --ignore-scripts
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Check OVERVIEW listing rules
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            for (const file of ["OVERVIEW.md", "OVERVIEW.zh-CN.md"]) {
+              const text = fs.readFileSync(file, "utf8");
+              for (const forbidden of ["paseo plugin add", "npm install", "npm i "]) {
+                if (text.includes(forbidden)) {
+                  throw new Error(`${file} contains forbidden registry string: ${forbidden}`);
+                }
+              }
+            }
+          '
+      - name: Allow Chromium user-namespace sandbox on Ubuntu 24.04
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Run unit tests
+        run: npm test
+      - name: Dry-run package tarball
+        run: npm pack --dry-run --ignore-scripts

@@ -1,0 +1,19 @@
+{
+  "id": "html-prototype-annotator",
+  "name": "Prototype Annotator",
+  "description": "Preview interactive HTML UI prototypes over Paseo without opening ports, drop visual pins or region boxes, and send structured Markdown feedback back to your agent.",
+  "translations": {
+    "zh-CN": {
+      "name": "HTML 原型审稿与标注",
+      "description": "零额外端口直接预览交互式 HTML 界面原型，支持点按水滴图钉、框选区域批注与一键将结构化反馈打回当前会话。"
+    }
+  },
+  "icon": "assets/icon.png",
+  "media": [
+    "assets/studio-desktop.png",
+    "assets/workflow-overview.png"
+  ],
+  "requirements": {
+    "paseo": ">=0.14.0"
+  }
+}
