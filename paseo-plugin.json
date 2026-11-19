@@ -10,6 +10,7 @@
   },
   "icon": "assets/icon.png",
   "media": [
+    "assets/hero.png",
     "assets/studio-desktop.png",
     "assets/workflow-overview.png"
   ],

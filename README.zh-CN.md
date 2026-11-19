@@ -4,7 +4,7 @@
 
 **Prototype Annotator**（`html-prototype-annotator`）是一款面向 [Paseo](https://paseo.sh) 的开源交互式 HTML 原型审稿与视觉打标插件：无需启动任何本地 HTTP 端口或内网穿透，直接预览 Agent 生成的 `.html` 界面原型、测试真实点击/弹窗交互、插入水滴图钉或框选区域，并一键将结构化 Markdown 修改意见打回当前会话。
 
-![Prototype Annotator 审稿台界面](./assets/studio-desktop.png)
+![Prototype Annotator 海报首图](./assets/hero.png)
 
 ## 核心特性
 

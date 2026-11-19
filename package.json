@@ -1,6 +1,6 @@
 {
   "name": "paseo-html-prototype-annotator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Preview interactive HTML UI prototypes over Paseo without opening ports, drop visual pins or region boxes, and send structured Markdown feedback back to your agent.",
   "license": "MIT",
   "author": "badyoung",
