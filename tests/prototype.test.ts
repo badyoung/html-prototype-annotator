@@ -379,6 +379,7 @@ test("switches sandboxed iframe from interact to pin mode via contentWindow.post
         "  }",
         "}",
         "document.getElementById('switchPin').addEventListener('click', () => { mode = 'pin'; sync(); });",
+        "frame.addEventListener('load', sync);",
         "window.addEventListener('message', (ev) => {",
         "  const d = ev.data;",
         "  if (!d || d.source !== 'paseo-proto-frame' || d.token !== 'tok-iframe-e2e') return;",
@@ -404,6 +405,7 @@ test("switches sandboxed iframe from interact to pin mode via contentWindow.post
     });
     const switchBtn = s1.hitBoxes.find((b) => b.part === "切换点按标注");
     assert.ok(switchBtn, "host switch button should exist");
+    await new Promise((r) => setTimeout(r, 120));
 
     // 1. Click '切换点按标注' in host bar -> calls contentWin.postMessage({ mode: 'pin' })
     await renderMobilePrototypeSnapshot({
@@ -413,6 +415,7 @@ test("switches sandboxed iframe from interact to pin mode via contentWindow.post
       clickXPct: switchBtn.xPct + switchBtn.wPct / 2,
       clickYPct: switchBtn.yPct + switchBtn.hPct / 2,
     });
+    await new Promise((r) => setTimeout(r, 120));
 
     // 2. Click inside the sandboxed iframe over #pad (around x=120px/414=29%, y=115px/510=22.5%)
     const s3 = await renderMobilePrototypeSnapshot({
