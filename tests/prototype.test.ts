@@ -317,6 +317,7 @@ test("renders mobile Retina snapshot + exact DOM hitBoxes over zero-port CDP pip
       "clicking button in interact mode must open hidden sheet and update hitBoxes",
     );
   } finally {
+    disposeMobileRenderer();
     rmSync(root, { recursive: true, force: true });
   }
 });

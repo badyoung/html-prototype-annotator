@@ -150,6 +150,7 @@ class ZeroPortPipeBrowser {
   private nextId = 1;
   private pending = new Map<number, CdpPendingCall>();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private linuxRequiresNoSandbox = false;
   private pageSession: {
     sessionId: string;
     frameId: string;
@@ -164,6 +165,7 @@ class ZeroPortPipeBrowser {
     this.idleTimer = setTimeout(() => {
       this.dispose();
     }, 180_000);
+    this.idleTimer.unref?.();
   }
 
   private cleanupTempProfile(): void {
@@ -216,17 +218,35 @@ class ZeroPortPipeBrowser {
       );
     }
 
-    const profileDir = mkdtempSync(join(tmpdir(), "paseo-proto-cdp-"));
-    this.tempProfileDir = profileDir;
-
-    const needsNoSandbox =
+    const isRootLinux =
       process.platform === "linux" &&
       typeof process.getuid === "function" &&
       process.getuid() === 0;
+    const initialNoSandbox = isRootLinux || this.linuxRequiresNoSandbox;
+
+    try {
+      return await this.launchWithSandboxMode(binary, initialNoSandbox);
+    } catch (firstErr) {
+      if (process.platform === "linux" && !initialNoSandbox) {
+        this.dispose();
+        this.linuxRequiresNoSandbox = true;
+        return await this.launchWithSandboxMode(binary, true);
+      }
+      this.dispose();
+      throw firstErr;
+    }
+  }
+
+  private async launchWithSandboxMode(
+    binary: string,
+    noSandbox: boolean,
+  ): Promise<{ sessionId: string; frameId: string }> {
+    const profileDir = mkdtempSync(join(tmpdir(), "paseo-proto-cdp-"));
+    this.tempProfileDir = profileDir;
 
     const args = [
       "--headless",
-      ...(needsNoSandbox ? ["--no-sandbox"] : []),
+      ...(noSandbox ? ["--no-sandbox", "--disable-setuid-sandbox"] : []),
       `--user-data-dir=${profileDir}`,
       "--incognito",
       "--no-first-run",
@@ -247,6 +267,8 @@ class ZeroPortPipeBrowser {
 
     const writeStream = child.stdio[3] as Writable;
     const readStream = child.stdio[4] as Readable;
+    writeStream.on("error", () => {});
+    readStream.on("error", () => {});
     this.proc = child;
     this.pipeWrite = writeStream;
 
@@ -280,17 +302,25 @@ class ZeroPortPipeBrowser {
       }
     });
 
-    child.on("exit", () => {
+    const onProcessClosed = (reason: string) => {
+      if (this.proc !== child) return;
       this.proc = null;
       this.pipeWrite = null;
       this.pageSession = null;
       for (const [, p] of this.pending) {
-        p.reject(new Error("Headless browser exited"));
+        p.reject(new Error(reason));
       }
       this.pending.clear();
+    };
+
+    child.on("error", (err) => {
+      onProcessClosed(`Headless browser spawn error: ${err.message}`);
+    });
+    child.on("exit", () => {
+      onProcessClosed("Headless browser exited");
     });
 
-    const targetsRes = await this.sendCdp("Target.getTargets", {});
+    const targetsRes = await this.sendCdp("Target.getTargets", {}, undefined, 5_000);
     const infos = (targetsRes.targetInfos as Array<{
       targetId: string;
       type: string;
@@ -328,6 +358,7 @@ class ZeroPortPipeBrowser {
     method: string,
     params: Record<string, unknown>,
     sessionId?: string,
+    timeoutMs = 12_000,
   ): Promise<Record<string, unknown>> {
     return new Promise((resolvePromise, rejectPromise) => {
       if (!this.pipeWrite) {
@@ -340,7 +371,8 @@ class ZeroPortPipeBrowser {
           this.pending.delete(id);
           rejectPromise(new Error(`CDP timeout on ${method}`));
         }
-      }, 12_000);
+      }, timeoutMs);
+      timer.unref?.();
 
       this.pending.set(id, {
         resolve: (val) => {
