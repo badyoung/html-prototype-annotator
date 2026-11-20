@@ -8,10 +8,10 @@
 
 ## 核心特性
 
-1. **零额外端口跨端直连**：服务端读取 `.html`/`.htm` 并自动内联相对引用的 `<link rel="stylesheet">` 与 `<img>` 静态资源（经 `realpath` 防护软链越界），跨桌面端、Web 端、Paseo Relay、Tunnel、Tailscale 及 iOS/Android 手机端即点即用。
-2. **先交互体验，再精准插针**：默认以「交互点击」态打开（标注层全程 `pointer-events: none` 透传手势），先直接点击测试 Tab、抽屉、弹窗与表单；随时切换「点按标注」或「框选区域」（支持按住 `Option`/`Alt` 临时穿透点击底层按钮）。
-3. **语义锚定不漂移**：自动提取外层 `data-screen` 画板名、`data-part` 控件语义、无障碍标签与简短选择器，支持局部滚动容器与动态重绘锚定。
-4. **草稿落盘 + 一键回传会话**：自动在 `<原型目录>/.annotations/` 下持久化 `.annotations.json` 与 `.annotations.md`，重开自动恢复图钉草稿，点击发送直接唤醒目标 Paseo 会话。
+1. **零额外端口跨端分片直连**：服务端读取 `.html`/`.htm` 并自动内联相对引用的 `<link rel="stylesheet">` 与 `<img>` 静态资源（经 `realpath` 防护软链越界，支持最高 64 MB 大体积内嵌媒体原型按 1.5 MB 分片流式传输），跨桌面端、Web 端、Paseo Relay、Tunnel、Tailscale 及 iOS/Android 手机端即点即用。
+2. **先交互体验，再精准插针**：默认以「交互点击」态打开（标注层全程 `pointer-events: none` 透传手势），先直接点击测试 Tab、抽屉、弹窗、内嵌滚动列表与上下切页手势；随时切换「点按标注」或「框选区域」（支持按住 `Option`/`Alt` 临时穿透点击底层按钮）。
+3. **语义锚定与手机全画幅适配**：自动提取外层 `data-screen` 画板名、`data-part` 控件语义、DOM 层级路径与可见文案摘要，支持局部滚动容器锚定及手机端 `100vh` 全画幅显示与当前激活画板图钉过滤。
+4. **草稿落盘 + `<prototype-feedback>` 聊天卡片**：自动在 `<原型目录>/.annotations/` 下持久化 `.annotations.json` 与 `.annotations.md`，多轮提交自动去重仅发新增/修改批注，并在桌面与手机聊天时间线直接渲染可折叠的格式化批注卡片。
 5. **原生中英双语切换**：随 Paseo 客户端语言自动切换英文与简体中文界面及回传 Markdown 语言。
 6. **内置 5 套主流前端与交互原型设计 Skill**：随包附带 `html-prototype-craft`、`frontend-design`（Anthropic Apache-2.0）、`baseline-ui`、`fixing-accessibility` 与 `fixing-motion-performance`（MIT），支持在插件设置页一键安装/卸载（自动保护已有同名技能），或直接运行 `npx skills add badyoung/html-prototype-annotator`。
 

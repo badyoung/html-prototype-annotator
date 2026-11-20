@@ -69,9 +69,14 @@ export function instrumentHtmlForWebAnnotator(
   html.__paseo-mode-interact #__paseo_mode_banner__ * {
     pointer-events: none !important;
   }
-  html.__paseo-mode-interact .__paseo-pin-badge,
-  html.__paseo-mode-interact .__paseo-box-overlay {
-    opacity: 0.45;
+  html.__paseo-mode-interact .__paseo-pin-badge:not(.__active),
+  html.__paseo-mode-interact .__paseo-box-overlay:not(.__active) {
+    display: none !important;
+  }
+  .__paseo-box-overlay:not(.__active):not(.__dragging) {
+    border-color: transparent !important;
+    background: transparent !important;
+    box-shadow: none !important;
   }
 
   #__paseo_overlay_layer__ {
@@ -132,6 +137,11 @@ export function instrumentHtmlForWebAnnotator(
   .__paseo-pin-badge:hover {
     transform: translate(-3px, -26px) rotate(-45deg) scale(1.12);
   }
+  .__paseo-pin-badge.__sent:not(.__active) {
+    background: linear-gradient(135deg, #64748B 0%, #475569 100%);
+    box-shadow: 0 3px 8px rgba(15, 23, 42, 0.22);
+    opacity: 0.78;
+  }
   .__paseo-pin-badge.__active {
     background: linear-gradient(135deg, #10B981 0%, #059669 100%);
     box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.28), 0 6px 16px rgba(5, 150, 105, 0.35);
@@ -172,6 +182,10 @@ export function instrumentHtmlForWebAnnotator(
     pointer-events: auto;
     cursor: pointer !important;
     box-shadow: 0 4px 10px rgba(15, 23, 42, 0.22);
+  }
+  .__paseo-box-overlay.__sent:not(.__active) .__paseo-box-tag {
+    background: linear-gradient(135deg, #64748B 0%, #475569 100%);
+    opacity: 0.78;
   }
   .__paseo-box-overlay.__active .__paseo-box-tag {
     background: linear-gradient(135deg, #10B981 0%, #059669 100%);
@@ -449,6 +463,18 @@ export function instrumentHtmlForWebAnnotator(
     return cls.length ? tag + "." + cls.join(".") : tag;
   }
 
+  function isScreenElVisible(el) {
+    var cur = el;
+    while (cur && cur !== document.documentElement) {
+      var st = window.getComputedStyle(cur);
+      if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) return false;
+      if (cur.classList && (cur.classList.contains("hidden") || cur.classList.contains("hidden-el"))) return false;
+      cur = cur.parentElement;
+    }
+    var r = el.getBoundingClientRect();
+    return r.width >= 20 && r.height >= 20;
+  }
+
   function resolveScreenHost(target) {
     if (target && target.closest) {
       var ds = target.closest("[data-screen]");
@@ -458,6 +484,19 @@ export function instrumentHtmlForWebAnnotator(
           name: cleanText(ds.getAttribute("data-screen"), 80) || I18N.screenFallback
         };
       }
+    }
+    var visibleScreens = [];
+    var allScreens = document.querySelectorAll("[data-screen]");
+    for (var i = 0; i < allScreens.length; i++) {
+      if (isScreenElVisible(allScreens[i])) {
+        visibleScreens.push(allScreens[i]);
+      }
+    }
+    if (visibleScreens.length === 1) {
+      return {
+        el: visibleScreens[0],
+        name: cleanText(visibleScreens[0].getAttribute("data-screen"), 80) || I18N.screenFallback
+      };
     }
     var body = document.body || document.documentElement;
     if (body && window.getComputedStyle(body).position === "static") {
@@ -469,15 +508,45 @@ export function instrumentHtmlForWebAnnotator(
     };
   }
 
+  function buildDomPath(el, stopEl) {
+    var parts = [];
+    var cur = el;
+    var depth = 0;
+    while (cur && cur.nodeType === 1 && cur !== document.documentElement && depth < 5) {
+      var seg = buildShortSelector(cur);
+      if (seg) {
+        if (!cur.id && cur.parentElement && cur.parentElement.children) {
+          var siblings = cur.parentElement.children;
+          var sameTag = [];
+          for (var i = 0; i < siblings.length; i++) {
+            if (siblings[i].tagName === cur.tagName) sameTag.push(siblings[i]);
+          }
+          if (sameTag.length > 1) {
+            seg += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+          }
+        }
+        parts.unshift(seg);
+      }
+      if (cur === stopEl || cur === document.body) break;
+      cur = cur.parentElement;
+      depth += 1;
+    }
+    return parts.join(" > ");
+  }
+
   function resolvePartSummary(target, screenEl) {
     if (!target || target === document.body || target === document.documentElement) {
-      return { part: I18N.canvasRegion, selector: "body" };
+      return { part: I18N.canvasRegion, selector: "body", domPath: "body", textSnippet: "" };
     }
     var dp = target.closest ? target.closest("[data-part]") : null;
     if (dp && (!screenEl || screenEl.contains(dp))) {
+      var dpText = cleanText(dp.innerText || dp.textContent || "", 84);
+      var dpPart = cleanText(dp.getAttribute("data-part"), 90) || I18N.componentFallback;
       return {
-        part: cleanText(dp.getAttribute("data-part"), 90) || I18N.componentFallback,
-        selector: buildShortSelector(dp)
+        part: dpPart,
+        selector: buildShortSelector(dp),
+        domPath: buildDomPath(dp, screenEl || document.body),
+        textSnippet: dpText && dpText !== dpPart ? dpText : ""
       };
     }
     var interactive = target.closest
@@ -485,25 +554,31 @@ export function instrumentHtmlForWebAnnotator(
       : null;
     var chosen = (interactive && (!screenEl || screenEl.contains(interactive))) ? interactive : target;
     var aria = chosen.getAttribute && (chosen.getAttribute("aria-label") || chosen.getAttribute("placeholder") || chosen.getAttribute("title"));
-    var text = cleanText(aria || chosen.innerText || chosen.textContent || "", 44);
+    var rawText = cleanText(chosen.innerText || chosen.textContent || "", 84);
+    var text = cleanText(aria || rawText || "", 44);
     var sel = buildShortSelector(chosen);
+    var finalPart = text ? text : (sel || I18N.elementFallback);
     return {
-      part: text ? text : (sel || I18N.elementFallback),
-      selector: sel
+      part: finalPart,
+      selector: sel,
+      domPath: buildDomPath(chosen, screenEl || document.body),
+      textSnippet: rawText && rawText !== finalPart ? rawText : ""
     };
   }
 
   function findHostForScreenName(screenName) {
     var nodes = document.querySelectorAll("[data-screen]");
+    if (nodes.length === 0) {
+      return document.body || document.documentElement;
+    }
     var visibleNodes = [];
     for (var i = 0; i < nodes.length; i++) {
+      if (!isScreenElVisible(nodes[i])) continue;
       var val = cleanText(nodes[i].getAttribute("data-screen"), 80);
       if (val === screenName) {
         return nodes[i];
       }
-      if (nodes[i].getClientRects && nodes[i].getClientRects().length > 0) {
-        visibleNodes.push({ el: nodes[i], val: val });
-      }
+      visibleNodes.push({ el: nodes[i], val: val });
     }
     var prefix = String(screenName || "").split("·")[0].trim();
     if (prefix) {
@@ -513,10 +588,11 @@ export function instrumentHtmlForWebAnnotator(
         }
       }
     }
-    if (visibleNodes.length === 1) {
-      return visibleNodes[0].el;
+    var docTitle = cleanText(document.title, 60);
+    if (docTitle && screenName === docTitle) {
+      return visibleNodes.length === 1 ? visibleNodes[0].el : (document.body || document.documentElement);
     }
-    return document.body || document.documentElement;
+    return null;
   }
 
   function getHostPageBox(hostEl) {
@@ -661,8 +737,14 @@ export function instrumentHtmlForWebAnnotator(
   function repositionOverlays() {
     for (var i = 0; i < overlayItems.length; i++) {
       var item = overlayItems[i];
+      var isAct = state.activePinId === item.pin.id;
       var host = findHostForScreenName(item.pin.screen);
-      var box = getHostPageBox(host);
+      if (!host && !isAct) {
+        item.el.style.display = "none";
+        continue;
+      }
+      item.el.style.display = "";
+      var box = getHostPageBox(host || document.body || document.documentElement);
       item.el.style.left = Math.round((box.left + (item.pin.xPct / 100) * box.width) * 10) / 10 + "px";
       item.el.style.top = Math.round((box.top + (item.pin.yPct / 100) * box.height) * 10) / 10 + "px";
       if (item.pin.kind === "box" && item.pin.wPct && item.pin.hPct) {
@@ -682,9 +764,10 @@ export function instrumentHtmlForWebAnnotator(
     for (var idx = 0; idx < state.pins.length; idx++) {
       (function(pin, num) {
         var isActive = state.activePinId === pin.id;
+        var sentCls = pin.sentAt ? " __sent" : "";
         if (pin.kind === "box" && pin.wPct && pin.hPct) {
           var box = document.createElement("div");
-          box.className = "__paseo-box-overlay" + (isActive ? " __active" : "");
+          box.className = "__paseo-box-overlay" + sentCls + (isActive ? " __active" : "");
           var tag = document.createElement("div");
           tag.className = "__paseo-box-tag";
           tag.textContent = "#" + num;
@@ -702,7 +785,7 @@ export function instrumentHtmlForWebAnnotator(
           overlayItems.push({ pin: pin, el: box });
         } else {
           var badge = document.createElement("div");
-          badge.className = "__paseo-pin-badge" + (isActive ? " __active" : "");
+          badge.className = "__paseo-pin-badge" + sentCls + (isActive ? " __active" : "");
           var inner = document.createElement("span");
           inner.textContent = String(num);
           badge.appendChild(inner);
@@ -875,6 +958,8 @@ export function instrumentHtmlForWebAnnotator(
               screen: altHost.name,
               part: altPart.part,
               selector: altPart.selector,
+              domPath: altPart.domPath,
+              textSnippet: altPart.textSnippet,
               xPct: altCoords.xPct,
               yPct: altCoords.yPct
             }
@@ -885,6 +970,7 @@ export function instrumentHtmlForWebAnnotator(
           state.popoverOpenForId = null;
           updatePopoverPosition(false);
         }
+        setTimeout(function() { repositionOverlays(); }, 60);
         return;
       }
 
@@ -897,6 +983,7 @@ export function instrumentHtmlForWebAnnotator(
       // In 'pin' mode: holding Option/Alt lets the click pass through to the prototype button!
       if (ev.altKey) {
         clearHover();
+        setTimeout(function() { repositionOverlays(); }, 60);
         return;
       }
 
@@ -915,6 +1002,8 @@ export function instrumentHtmlForWebAnnotator(
           screen: hostInfo.name,
           part: partInfo.part,
           selector: partInfo.selector,
+          domPath: partInfo.domPath,
+          textSnippet: partInfo.textSnippet,
           xPct: coords.xPct,
           yPct: coords.yPct
         }
@@ -953,7 +1042,7 @@ export function instrumentHtmlForWebAnnotator(
       var hostBox = getHostPageBox(hostInfo.el);
       var start = computeContainerMetrics(hostInfo.el, ev.clientX, ev.clientY);
       var preview = document.createElement("div");
-      preview.className = "__paseo-box-overlay";
+      preview.className = "__paseo-box-overlay __dragging";
       if (overlayLayerEl) overlayLayerEl.appendChild(preview);
 
       dragState = {
@@ -1010,6 +1099,8 @@ export function instrumentHtmlForWebAnnotator(
             screen: ds.screenName,
             part: tapPart.part,
             selector: tapPart.selector,
+            domPath: tapPart.domPath,
+            textSnippet: tapPart.textSnippet,
             xPct: ds.startX,
             yPct: ds.startY
           }
@@ -1022,24 +1113,28 @@ export function instrumentHtmlForWebAnnotator(
       var minCy = Math.min(ds.startClientY, ev.clientY);
       var maxCy = Math.max(ds.startClientY, ev.clientY);
       var enclosedParts = [];
+      var firstEnclosedEl = null;
       var candidates = ds.hostEl.querySelectorAll("[data-part]");
       for (var i = 0; i < candidates.length; i++) {
         var r = candidates[i].getBoundingClientRect();
         var cx = r.left + r.width / 2;
         var cy = r.top + r.height / 2;
         if (cx >= minCx && cx <= maxCx && cy >= minCy && cy <= maxCy) {
+          if (!firstEnclosedEl) firstEnclosedEl = candidates[i];
           var pName = cleanText(candidates[i].getAttribute("data-part"), 45);
           if (pName && enclosedParts.indexOf(pName) === -1) enclosedParts.push(pName);
           if (enclosedParts.length >= 3) break;
         }
       }
-      var fallbackPart = resolvePartSummary(ds.startTarget, ds.hostEl);
+      var fallbackPart = resolvePartSummary(firstEnclosedEl || ds.startTarget, ds.hostEl);
       postToHost("add-pin", {
         draft: {
           kind: "box",
           screen: ds.screenName,
           part: enclosedParts.length ? enclosedParts.join(" + ") : fallbackPart.part,
           selector: fallbackPart.selector,
+          domPath: fallbackPart.domPath,
+          textSnippet: fallbackPart.textSnippet,
           xPct: left,
           yPct: top,
           wPct: w,

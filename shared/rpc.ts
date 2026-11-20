@@ -2,14 +2,17 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import { annotationPinSchema } from "./annotations";
 
-export const MAX_PROTOTYPE_HTML_BYTES = 8 * 1024 * 1024;
-export const MAX_BUNDLED_ASSET_BYTES = 4 * 1024 * 1024;
-export const MAX_TOTAL_BUNDLED_BYTES = 12 * 1024 * 1024;
+export const MAX_PROTOTYPE_HTML_BYTES = 64 * 1024 * 1024;
+export const MAX_BUNDLED_ASSET_BYTES = 16 * 1024 * 1024;
+export const MAX_TOTAL_BUNDLED_BYTES = 64 * 1024 * 1024;
+export const PROTOTYPE_HTML_CHUNK_CHARS = 1_500_000;
 
 export const domHitBoxSchema = z.object({
   screen: z.string(),
   part: z.string(),
   selector: z.string().optional(),
+  domPath: z.string().optional(),
+  textSnippet: z.string().optional(),
   xPct: z.number(),
   yPct: z.number(),
   wPct: z.number(),
@@ -24,6 +27,8 @@ export type DomHitBox = z.infer<typeof domHitBoxSchema>;
 export const loadHtmlPrototypeInputSchema = z.object({
   rawPath: z.string().min(1).max(4096),
   cwd: z.string().max(4096).nullable().optional(),
+  omitHtml: z.boolean().optional(),
+  maxInlineChars: z.number().int().min(0).max(4_000_000).optional(),
 });
 
 export const loadHtmlPrototypeOutputSchema = z.object({
@@ -33,6 +38,8 @@ export const loadHtmlPrototypeOutputSchema = z.object({
   byteSize: z.number().int().nonnegative(),
   modifiedAt: z.string(),
   bundledHtml: z.string(),
+  totalHtmlChars: z.number().int().nonnegative().default(0),
+  htmlComplete: z.boolean().default(true),
   semanticScreens: z.array(z.string()),
   semanticParts: z.array(z.string()),
   savedPins: z.array(annotationPinSchema),
@@ -49,12 +56,77 @@ export const loadHtmlPrototypeRpc = defineRpc({
   output: loadHtmlPrototypeOutputSchema,
 });
 
+export const readPrototypeHtmlChunkInputSchema = z.object({
+  resolvedPath: z.string().min(1).max(4096),
+  offset: z.number().int().nonnegative(),
+  maxChars: z
+    .number()
+    .int()
+    .min(4096)
+    .max(4_000_000)
+    .default(PROTOTYPE_HTML_CHUNK_CHARS),
+});
+
+export const readPrototypeHtmlChunkOutputSchema = z.object({
+  chunk: z.string(),
+  nextOffset: z.number().int().nonnegative(),
+  totalChars: z.number().int().nonnegative(),
+  eof: z.boolean(),
+});
+
+export type ReadPrototypeHtmlChunkOutput = z.infer<
+  typeof readPrototypeHtmlChunkOutputSchema
+>;
+
+export const readPrototypeHtmlChunkRpc = defineRpc({
+  name: "html-prototype-annotator.read-prototype-chunk",
+  input: readPrototypeHtmlChunkInputSchema,
+  output: readPrototypeHtmlChunkOutputSchema,
+});
+
+export async function assembleFullPrototypeHtml(
+  loaded: LoadHtmlPrototypeOutput,
+  readChunk: (input: {
+    resolvedPath: string;
+    offset: number;
+    maxChars?: number;
+  }) => Promise<ReadPrototypeHtmlChunkOutput>,
+  isCancelled?: () => boolean,
+): Promise<string> {
+  if (loaded.htmlComplete && loaded.bundledHtml.length >= loaded.totalHtmlChars) {
+    return loaded.bundledHtml;
+  }
+  const parts: string[] = loaded.bundledHtml ? [loaded.bundledHtml] : [];
+  let offset = loaded.bundledHtml.length;
+  const targetLen = loaded.totalHtmlChars;
+  let guard = 0;
+
+  while (offset < targetLen && guard < 128) {
+    if (isCancelled?.()) return "";
+    guard += 1;
+    const res = await readChunk({
+      resolvedPath: loaded.resolvedPath,
+      offset,
+      maxChars: PROTOTYPE_HTML_CHUNK_CHARS,
+    });
+    if (res.chunk) parts.push(res.chunk);
+    if (res.eof || res.nextOffset <= offset) break;
+    offset = res.nextOffset;
+  }
+
+  return parts.join("");
+}
+
 export const renderMobilePrototypeInputSchema = z.object({
   resolvedPath: z.string().min(1).max(4096),
   viewportWidth: z.number().int().min(320).max(1440).default(414),
+  viewportHeight: z.number().int().min(480).max(2400).default(844),
   cleanChrome: z.boolean().default(true),
   clickXPct: z.number().min(0).max(100).optional(),
   clickYPct: z.number().min(0).max(100).optional(),
+  scrollDeltaY: z.number().min(-2000).max(2000).optional(),
+  scrollXPct: z.number().min(0).max(100).optional(),
+  scrollYPct: z.number().min(0).max(100).optional(),
   resetSession: z.boolean().optional(),
 });
 
@@ -63,6 +135,8 @@ export const renderMobilePrototypeOutputSchema = z.object({
   docWidth: z.number().positive(),
   docHeight: z.number().positive(),
   hitBoxes: z.array(domHitBoxSchema),
+  activeScreens: z.array(z.string()).default([]),
+  pageTitle: z.string().default(""),
 });
 
 export type RenderMobilePrototypeOutput = z.infer<
@@ -92,6 +166,8 @@ export const submitPrototypeAnnotationsOutputSchema = z.object({
   markdown: z.string(),
   sentToAgent: z.boolean(),
   targetAgentId: z.string().nullable(),
+  sentCount: z.number().int().nonnegative().default(0),
+  updatedPins: z.array(annotationPinSchema).optional(),
 });
 
 export type SubmitPrototypeAnnotationsOutput = z.infer<

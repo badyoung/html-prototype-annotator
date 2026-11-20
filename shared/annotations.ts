@@ -9,6 +9,8 @@ export const annotationPinSchema = z.object({
   screen: z.string().max(160).default("主画板"),
   part: z.string().max(240).default("画面区域"),
   selector: z.string().max(240).optional(),
+  domPath: z.string().max(400).optional(),
+  textSnippet: z.string().max(240).optional(),
   xPct: z.number().min(0).max(100),
   yPct: z.number().min(0).max(100),
   wPct: z.number().min(0).max(100).optional(),
@@ -17,6 +19,7 @@ export const annotationPinSchema = z.object({
   canvasYPct: z.number().min(0).max(100).optional(),
   canvasWPct: z.number().min(0).max(100).optional(),
   canvasHPct: z.number().min(0).max(100).optional(),
+  sentAt: z.string().max(64).optional(),
   note: z.string().max(4000).default(""),
 });
 
@@ -284,6 +287,14 @@ export function isChineseLocale(locale?: string | null): boolean {
   return /^zh(?:\b|[-_])/i.test(locale.trim());
 }
 
+function escapeXmlAttr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 export function formatAnnotationsMarkdown(params: {
   fileName: string;
   resolvedPath: string;
@@ -304,10 +315,13 @@ export function formatAnnotationsMarkdown(params: {
   } = params;
   const zh = isChineseLocale(locale);
   const trimmedOverall = overallNote?.trim() ?? "";
+  const safeFileAttr = escapeXmlAttr(fileName);
 
   if (pins.length === 0 && (approvedAsIs || !trimmedOverall)) {
+    const openTag = `<prototype-feedback version="1" status="approved" file="${safeFileAttr}" count="0">`;
     if (zh) {
       const header = [
+        openTag,
         `### ✅ HTML 原型确认通过：\`${fileName}\``,
         `- 原型文件：\`${resolvedPath}\``,
         ...(savedMarkdownPath ? [`- 批注存档：\`${savedMarkdownPath}\``] : []),
@@ -315,10 +329,12 @@ export function formatAnnotationsMarkdown(params: {
         trimmedOverall
           ? `整体说明：${trimmedOverall}`
           : "无额外视觉/交互修改标注，请按此原型继续推进实现。",
+        "</prototype-feedback>",
       ];
       return header.join("\n");
     }
     const header = [
+      openTag,
       `### ✅ HTML Prototype Approved: \`${fileName}\``,
       `- Prototype file: \`${resolvedPath}\``,
       ...(savedMarkdownPath ? [`- Saved feedback: \`${savedMarkdownPath}\``] : []),
@@ -326,16 +342,25 @@ export function formatAnnotationsMarkdown(params: {
       trimmedOverall
         ? `Overall note: ${trimmedOverall}`
         : "Approved with no visual or interaction changes requested. Please proceed with implementation.",
+      "</prototype-feedback>",
     ];
     return header.join("\n");
   }
 
+  const distinctScreens = new Set(
+    pins.map((p) => p.screen.trim()).filter(Boolean),
+  ).size;
+  const openTag = `<prototype-feedback version="1" status="changes_requested" file="${safeFileAttr}" count="${pins.length}" screens="${distinctScreens}">`;
+
   if (zh) {
+    const screenSummary =
+      distinctScreens > 1 ? `（涉及 **${distinctScreens}** 个画板）` : "";
     const lines: string[] = [
+      openTag,
       `### 📌 HTML 原型视觉批注反馈：\`${fileName}\``,
       `- 原型文件：\`${resolvedPath}\``,
       ...(savedMarkdownPath ? [`- 批注存档：\`${savedMarkdownPath}\``] : []),
-      `- 标注数量：共 **${pins.length}** 处`,
+      `- 标注数量：共 **${pins.length}** 处${screenSummary}`,
       "",
     ];
 
@@ -354,6 +379,12 @@ export function formatAnnotationsMarkdown(params: {
       lines.push(
         `${num}. **#${num} ${screenPrefix}${pin.part || "画面区域"}**（${coordDesc}${selSuffix}）`,
       );
+      if (pin.domPath && pin.domPath !== pin.selector) {
+        lines.push(`   - DOM 路径：\`${pin.domPath}\``);
+      }
+      if (pin.textSnippet) {
+        lines.push(`   - 元素文本：「${pin.textSnippet.replace(/\r?\n/g, " ")}」`);
+      }
       lines.push(`   > ${noteText.replace(/\r?\n/g, "\n   > ")}`);
     });
 
@@ -362,14 +393,18 @@ export function formatAnnotationsMarkdown(params: {
       lines.push(`**整体补充说明**：${trimmedOverall}`);
     }
 
+    lines.push("</prototype-feedback>");
     return lines.join("\n");
   }
 
+  const screenSummaryEn =
+    distinctScreens > 1 ? ` across **${distinctScreens}** screens` : "";
   const lines: string[] = [
+    openTag,
     `### 📌 HTML Prototype Annotations: \`${fileName}\``,
     `- Prototype file: \`${resolvedPath}\``,
     ...(savedMarkdownPath ? [`- Saved feedback: \`${savedMarkdownPath}\``] : []),
-    `- Annotations: **${pins.length}**`,
+    `- Annotations: **${pins.length}**${screenSummaryEn}`,
     "",
   ];
 
@@ -389,6 +424,12 @@ export function formatAnnotationsMarkdown(params: {
     lines.push(
       `${num}. **#${num} ${screenPrefix}${pin.part || "Canvas region"}** (${coordDesc}${selSuffix})`,
     );
+    if (pin.domPath && pin.domPath !== pin.selector) {
+      lines.push(`   - DOM path: \`${pin.domPath}\``);
+    }
+    if (pin.textSnippet) {
+      lines.push(`   - Element text: "${pin.textSnippet.replace(/\r?\n/g, " ")}"`);
+    }
     lines.push(`   > ${noteText.replace(/\r?\n/g, "\n   > ")}`);
   });
 
@@ -397,5 +438,206 @@ export function formatAnnotationsMarkdown(params: {
     lines.push(`**Overall notes**: ${trimmedOverall}`);
   }
 
+  lines.push("</prototype-feedback>");
   return lines.join("\n");
+}
+
+export const parsedFeedbackItemSchema = z.object({
+  index: z.number().int().positive(),
+  kind: z.enum(["pin", "box"]),
+  screen: z.string().optional(),
+  part: z.string(),
+  coordSummary: z.string().optional(),
+  selector: z.string().optional(),
+  domPath: z.string().optional(),
+  textSnippet: z.string().optional(),
+  note: z.string(),
+});
+
+export type ParsedFeedbackItem = z.infer<typeof parsedFeedbackItemSchema>;
+
+export const parsedPrototypeFeedbackSchema = z.object({
+  status: z.enum(["approved", "changes_requested"]),
+  fileName: z.string(),
+  prototypePath: z.string().optional(),
+  savedMarkdownPath: z.string().optional(),
+  items: z.array(parsedFeedbackItemSchema),
+  overallNote: z.string().optional(),
+});
+
+export type ParsedPrototypeFeedback = z.infer<
+  typeof parsedPrototypeFeedbackSchema
+>;
+
+export function parsePrototypeFeedbackMessage(
+  rawText: string,
+): ParsedPrototypeFeedback | null {
+  if (!rawText || rawText.length < 18) return null;
+  const trimmed = rawText.trim();
+
+  const hasEnvelope = trimmed.includes("<prototype-feedback");
+  const hasLegacyHeader =
+    trimmed.startsWith("### 📌 HTML 原型视觉批注反馈：") ||
+    trimmed.startsWith("### ✅ HTML 原型确认通过：") ||
+    trimmed.startsWith("### 📌 HTML Prototype Annotations:") ||
+    trimmed.startsWith("### ✅ HTML Prototype Approved:");
+
+  if (!hasEnvelope && !hasLegacyHeader) return null;
+
+  const inner = trimmed
+    .replace(/^[\s\S]*?<prototype-feedback\b[^>]*>\s*/i, "")
+    .replace(/\s*<\/prototype-feedback>\s*$/i, "")
+    .trim();
+
+  const lines = inner.split(/\r?\n/);
+  const headingLine = lines.find((l) => l.startsWith("### ")) ?? "";
+  const isApproved =
+    /status="approved"/i.test(trimmed) ||
+    headingLine.includes("✅") ||
+    headingLine.includes("确认通过") ||
+    headingLine.includes("Approved");
+
+  const headingFileMatch = /`([^`]+)`/.exec(headingLine);
+  const attrFileMatch = /\bfile="([^"]+)"/i.exec(trimmed);
+  let fileName =
+    headingFileMatch?.[1]?.trim() || attrFileMatch?.[1]?.trim() || "prototype.html";
+
+  let prototypePath: string | undefined;
+  let savedMarkdownPath: string | undefined;
+  let overallNote: string | undefined;
+  const items: ParsedFeedbackItem[] = [];
+
+  let currentItem: ParsedFeedbackItem | null = null;
+  let approvedBodyLines: string[] = [];
+
+  const flushCurrent = () => {
+    if (currentItem) {
+      currentItem.note = currentItem.note.trim();
+      items.push(currentItem);
+      currentItem = null;
+    }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i] ?? "";
+    const line = rawLine.trim();
+    if (!line || line.startsWith("### ")) continue;
+
+    const protoPathMatch =
+      /^-\s*(?:原型文件|Prototype file)[：:]\s*`([^`]+)`/.exec(line);
+    if (protoPathMatch?.[1]) {
+      prototypePath = protoPathMatch[1].trim();
+      if (!headingFileMatch && prototypePath) {
+        fileName = extractFileName(prototypePath) || fileName;
+      }
+      continue;
+    }
+
+    const savedMdMatch =
+      /^-\s*(?:批注存档|Saved feedback)[：:]\s*`([^`]+)`/.exec(line);
+    if (savedMdMatch?.[1]) {
+      savedMarkdownPath = savedMdMatch[1].trim();
+      continue;
+    }
+
+    if (/^-\s*(?:标注数量|Annotations)[：:]/.test(line)) {
+      continue;
+    }
+
+    const overallMatch =
+      /^(?:\*\*(?:整体补充说明|Overall notes)\*\*|整体说明|Overall note)[：:]\s*(.+)$/.exec(
+        line,
+      );
+    if (overallMatch?.[1]) {
+      flushCurrent();
+      overallNote = overallMatch[1].trim();
+      continue;
+    }
+
+    // Match numbered item header: e.g. `1. **#1 [Screen] Part**（框选 ... · `sel`）` or `1. **#1 [Screen] Part** (region ... · `sel`)`
+    const itemMatch =
+      /^(\d+)\.\s*\*\*#\d+\s*(?:\[([^\]]+)\]\s*)?([^*]+)\*\*\s*[（(](.+)[)）]\s*$/.exec(
+        line,
+      );
+    if (itemMatch) {
+      flushCurrent();
+      const idx = Number.parseInt(itemMatch[1] ?? "1", 10) || items.length + 1;
+      const screen = itemMatch[2]?.trim() || undefined;
+      const part = itemMatch[3]?.trim() || "UI";
+      const metaRaw = itemMatch[4]?.trim() ?? "";
+      const isBox =
+        metaRaw.startsWith("框选") || metaRaw.toLowerCase().startsWith("region");
+
+      let selector: string | undefined;
+      let coordSummary = metaRaw.replace(/`/g, "");
+      const trailingSelMatch = /^(.*)\s*·\s*`([^`]+)`\s*$/.exec(metaRaw);
+      if (trailingSelMatch) {
+        const candidateSel = trailingSelMatch[2]?.trim() ?? "";
+        // Distinguish CSS selector from `80.0% × 10.0%` dimension token
+        if (candidateSel && !candidateSel.includes("%")) {
+          selector = candidateSel;
+          coordSummary = (trailingSelMatch[1] ?? "").replace(/`/g, "").trim();
+        }
+      }
+
+      currentItem = {
+        index: idx,
+        kind: isBox ? "box" : "pin",
+        ...(screen ? { screen } : {}),
+        part,
+        ...(coordSummary ? { coordSummary } : {}),
+        ...(selector ? { selector } : {}),
+        note: "",
+      };
+      continue;
+    }
+
+    if (currentItem) {
+      const domPathMatch = /^-\s*DOM\s*(?:路径|path)[：:]\s*`([^`]+)`/i.exec(line);
+      if (domPathMatch?.[1]) {
+        currentItem.domPath = domPathMatch[1].trim();
+        continue;
+      }
+      const textSnapMatch =
+        /^-\s*(?:元素文本|Element text)[：:]\s*[「"](.+)[」"]$/.exec(line);
+      if (textSnapMatch?.[1]) {
+        currentItem.textSnippet = textSnapMatch[1].trim();
+        continue;
+      }
+      const quoteMatch = /^>\s?(.*)$/.exec(line);
+      if (quoteMatch) {
+        const chunk = (quoteMatch[1] ?? "")
+          .replace(/^\*\*(?:修改意见|Note)\*\*[：:]\s*/, "")
+          .trim();
+        currentItem.note = currentItem.note
+          ? `${currentItem.note}\n${chunk}`
+          : chunk;
+        continue;
+      }
+    } else if (isApproved) {
+      approvedBodyLines.push(line);
+    }
+  }
+
+  flushCurrent();
+
+  if (isApproved && !overallNote && approvedBodyLines.length > 0) {
+    const joined = approvedBodyLines.join(" ").trim();
+    if (
+      joined &&
+      !joined.includes("无额外视觉/交互修改标注") &&
+      !joined.includes("Approved with no visual or interaction changes")
+    ) {
+      overallNote = joined;
+    }
+  }
+
+  return {
+    status: isApproved ? "approved" : "changes_requested",
+    fileName,
+    ...(prototypePath ? { prototypePath } : {}),
+    ...(savedMarkdownPath ? { savedMarkdownPath } : {}),
+    items,
+    ...(overallNote ? { overallNote } : {}),
+  };
 }

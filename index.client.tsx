@@ -10,6 +10,7 @@ import {
   extractFileName,
   extractHtmlPrototypeTargets,
   HTML_EXTENSIONS,
+  parsePrototypeFeedbackMessage,
 } from "./shared/annotations";
 import { registerHtmlPrototypeBridge } from "./shared/bridge";
 import {
@@ -21,9 +22,13 @@ import { protoLabel, useProtoI18n } from "./client/i18n";
 import { PrototypeAnnotatorSettingsScreen } from "./client/settings-screen";
 import {
   AssistantPrototypeMessageRenderer,
+  PROTOTYPE_FEEDBACK_TIMELINE_KIND,
+  PROTOTYPE_FEEDBACK_TIMELINE_VERSION,
   PROTOTYPE_TIMELINE_KIND,
   PROTOTYPE_TIMELINE_VERSION,
+  prototypeFeedbackTimelineDataSchema,
   prototypeTimelineDataSchema,
+  UserPrototypeFeedbackRenderer,
 } from "./client/timeline-message";
 
 interface TopAgentRecord extends AgentTargetOption {
@@ -318,6 +323,38 @@ export default function contribute(client: PluginClientContext) {
       version: PROTOTYPE_TIMELINE_VERSION,
       schema: prototypeTimelineDataSchema,
       Component: AssistantPrototypeMessageRenderer,
+    }),
+  );
+
+  cleanups.push(
+    client.addTimelineTransformer({
+      id: "html-prototype-user-feedback",
+      query: { itemType: "user_message" },
+      transform({ item }) {
+        const parsed = parsePrototypeFeedbackMessage(item.text);
+        if (!parsed) return undefined;
+        return {
+          items: [
+            {
+              type: "plugin",
+              kind: PROTOTYPE_FEEDBACK_TIMELINE_KIND,
+              version: PROTOTYPE_FEEDBACK_TIMELINE_VERSION,
+              data: {
+                feedback: parsed,
+              },
+            },
+          ],
+        };
+      },
+    }),
+  );
+
+  cleanups.push(
+    client.addTimelineRenderer({
+      kind: PROTOTYPE_FEEDBACK_TIMELINE_KIND,
+      version: PROTOTYPE_FEEDBACK_TIMELINE_VERSION,
+      schema: prototypeFeedbackTimelineDataSchema,
+      Component: UserPrototypeFeedbackRenderer,
     }),
   );
 

@@ -11,6 +11,7 @@ export const HTML_PROTOTYPE_DELIVERY_PROMPT = [
   "当前宿主已启用 `html-prototype-annotator` 插件（全程走 Paseo 加密通道，**严禁为预览原型临时启动任何本地 HTTP 端口或映射服务**）：",
   "- **何时使用**：涉及新页面设计、布局/视觉改版、多方案取舍或复杂弹窗/多状态交互时，在改正式代码或派工前先出轻量自包含 `.html` 原型（落盘至 `.artifacts/prototypes/`）与用户对齐；纯逻辑/纯接口适配/明确微调直接执行，不强出原型。",
   "- **怎么编写与交付**：插件默认以「交互点击」态打开，且标注遮罩层全程 `pointer-events: none` 透传 `click / mousedown / pointermove / touchmove` 手势；编写原型时请把按钮点击、Tab 切换、弹窗与拖拽滑动等真实交互状态做活，仅保留干净界面画板（**严禁在 `.html` 内再手写顶部打标栏、批注侧栏或全屏拦截遮罩**），给画板容器加 `data-screen=\"页面名\"`、给关键控件加 `data-part=\"控件语义名\"`，在回复中直接附上 `[原型文件名.html](file:///绝对路径)`；用户点击即可直接操作交互、随时切「点按标注」插图钉并一键把批注打回当前对话。",
+  "- **怎么消费回传批注**：用户打回的意见以 `<prototype-feedback version=\"1\" status=\"approved|changes_requested\" ...>` 结构化块送达，每条包含 `[画板] 部件名`、精确百分比坐标、`DOM 路径`、`元素文本` 与修改意见；请严格对照画板与 DOM 路径逐条落实，出新版原型时建议递增版本号（如 `v2.html`）以免旧轮次批注混叠。",
 ].join("\n");
 
 export function getDefaultPrototypePromptFilePath(): string {

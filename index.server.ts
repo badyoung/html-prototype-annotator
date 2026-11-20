@@ -9,6 +9,8 @@ import {
   getBundledSkillsStatusRpc,
   loadHtmlPrototypeRpc,
   manageBundledSkillsRpc,
+  PROTOTYPE_HTML_CHUNK_CHARS,
+  readPrototypeHtmlChunkRpc,
   renderMobilePrototypeRpc,
   submitPrototypeAnnotationsRpc,
 } from "./shared/rpc";
@@ -25,6 +27,7 @@ import {
 } from "./server/prompt-injection";
 import {
   loadHtmlPrototype,
+  readPrototypeHtmlChunk,
   submitPrototypeAnnotations,
 } from "./server/prototype-service";
 import {
@@ -59,6 +62,16 @@ export default function contribute(server: PluginServerContext) {
     return loadHtmlPrototype({
       rawPath: input.rawPath,
       cwd: input.cwd ?? null,
+      omitHtml: input.omitHtml,
+      maxInlineChars: input.maxInlineChars ?? PROTOTYPE_HTML_CHUNK_CHARS,
+    });
+  });
+
+  server.handle(readPrototypeHtmlChunkRpc, async (input) => {
+    return readPrototypeHtmlChunk({
+      resolvedPath: input.resolvedPath,
+      offset: input.offset,
+      maxChars: input.maxChars,
     });
   });
 
@@ -66,9 +79,13 @@ export default function contribute(server: PluginServerContext) {
     return renderMobilePrototypeSnapshot({
       resolvedPath: input.resolvedPath,
       viewportWidth: input.viewportWidth,
+      viewportHeight: input.viewportHeight,
       cleanChrome: input.cleanChrome,
       clickXPct: input.clickXPct,
       clickYPct: input.clickYPct,
+      scrollDeltaY: input.scrollDeltaY,
+      scrollXPct: input.scrollXPct,
+      scrollYPct: input.scrollYPct,
       resetSession: input.resetSession,
     });
   });

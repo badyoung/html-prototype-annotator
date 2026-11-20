@@ -1,11 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import type { DomHitBox, RenderMobilePrototypeOutput } from "../shared/rpc";
-import { bundleLocalHtmlAssets, resolvePrototypePath } from "./prototype-service";
+import { getCachedBundledPrototype } from "./prototype-service";
 
 const CLEAN_CHROME_CSS = `
   .topbar:has(#toggleAnnotateBtn),
@@ -409,14 +408,22 @@ class ZeroPortPipeBrowser {
     bundledHtml: string;
     modifiedAt: string;
     viewportWidth: number;
+    viewportHeight: number;
     cleanChrome: boolean;
     clickXPct?: number;
     clickYPct?: number;
+    scrollDeltaY?: number;
+    scrollXPct?: number;
+    scrollYPct?: number;
     resetSession?: boolean;
   }): Promise<RenderMobilePrototypeOutput> {
     return this.runSerialized(async () => {
       const { sessionId, frameId } = await this.ensureStarted();
-      const key = `${params.resolvedPath}|${params.modifiedAt}|${params.viewportWidth}|${params.cleanChrome ? "clean" : "raw"}`;
+      const targetVpH = Math.max(
+        480,
+        Math.min(2400, Math.round(params.viewportHeight || 520)),
+      );
+      const key = `${params.resolvedPath}|${params.modifiedAt}|${params.viewportWidth}x${targetVpH}|${params.cleanChrome ? "clean" : "raw"}`;
 
       const needsReload =
         params.resetSession ||
@@ -428,47 +435,124 @@ class ZeroPortPipeBrowser {
           "Emulation.setDeviceMetricsOverride",
           {
             width: params.viewportWidth,
-            height: 480,
+            height: targetVpH,
             deviceScaleFactor: 2,
             mobile: params.viewportWidth <= 540,
           },
           sessionId,
         );
 
-        const htmlToLoad = params.cleanChrome
+        let htmlToLoad = params.cleanChrome
           ? params.bundledHtml.replace(
               /<\/head>/i,
               `<style>${CLEAN_CHROME_CSS}</style></head>`,
             )
           : params.bundledHtml;
+        if (
+          params.viewportWidth <= 540 &&
+          !/<meta\b[^>]*name=["']viewport["']/i.test(htmlToLoad)
+        ) {
+          htmlToLoad = /<head\b[^>]*>/i.test(htmlToLoad)
+            ? htmlToLoad.replace(
+                /<head\b[^>]*>/i,
+                (m) =>
+                  `${m}<meta name="viewport" content="width=device-width, initial-scale=1">`,
+              )
+            : `<meta name="viewport" content="width=device-width, initial-scale=1">${htmlToLoad}`;
+        }
 
         await this.sendCdp(
           "Page.setDocumentContent",
           { frameId, html: htmlToLoad },
           sessionId,
         );
-        await new Promise((r) => setTimeout(r, 90));
+        await new Promise((r) => setTimeout(r, 95));
         if (this.pageSession) {
           this.pageSession.loadedKey = key;
+          this.pageSession.docWidth = params.viewportWidth;
+          this.pageSession.docHeight = targetVpH;
         }
       }
 
-      // Measure initial document dimensions before optional click
+      // Measure initial document dimensions before optional click / swipe
       const preEval = await this.sendCdp(
         "Runtime.evaluate",
         {
           expression: `(() => ({
             w: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, window.innerWidth, 1),
-            h: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, 480)
+            h: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, ${targetVpH})
           }))()`,
           returnByValue: true,
         },
         sessionId,
       );
       const preSize = ((preEval.result as { value?: { w: number; h: number } })
-        ?.value) ?? { w: params.viewportWidth, h: 900 };
+        ?.value) ?? { w: params.viewportWidth, h: targetVpH };
 
       if (
+        params.scrollDeltaY !== undefined &&
+        Math.abs(params.scrollDeltaY) >= 4 &&
+        this.pageSession
+      ) {
+        const prevW = this.pageSession.docWidth || preSize.w;
+        const prevH = this.pageSession.docHeight || Math.min(preSize.h, 7600);
+        const sx = Math.max(4, Math.min(prevW - 4, Math.round(((params.scrollXPct ?? 50) / 100) * prevW)));
+        const sy = Math.max(4, Math.min(prevH - 4, Math.round(((params.scrollYPct ?? 50) / 100) * prevH)));
+        const dy = Math.round(params.scrollDeltaY);
+
+        // Check if element under (sx, sy) sits inside an inner overflow-y scrollable container;
+        // if so, scroll it directly + wheel; otherwise dispatch touch/pointer vertical swipe for feed players!
+        const scrolledInner = await this.sendCdp(
+          "Runtime.evaluate",
+          {
+            expression: `(() => {
+              let el = document.elementFromPoint(${sx}, ${sy});
+              while (el && el !== document.body && el !== document.documentElement) {
+                const st = window.getComputedStyle(el);
+                if ((st.overflowY === "auto" || st.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 2) {
+                  const before = el.scrollTop;
+                  el.scrollTop = Math.max(0, Math.min(el.scrollHeight - el.clientHeight, before + (${dy})));
+                  el.dispatchEvent(new Event("scroll", { bubbles: true }));
+                  return true;
+                }
+                el = el.parentElement;
+              }
+              return false;
+            })()`,
+            returnByValue: true,
+          },
+          sessionId,
+        );
+        const didScrollInner = Boolean((scrolledInner.result as { value?: boolean })?.value);
+        if (!didScrollInner) {
+          await this.sendCdp(
+            "Input.dispatchMouseEvent",
+            { type: "mouseWheel", x: sx, y: sy, deltaX: 0, deltaY: dy },
+            sessionId,
+          ).catch(() => {});
+          const swipeTravel = Math.max(-240, Math.min(240, -dy));
+          const endY = Math.max(12, Math.min(prevH - 12, sy + swipeTravel));
+          await this.sendCdp(
+            "Input.dispatchTouchEvent",
+            { type: "touchStart", touchPoints: [{ x: sx, y: sy, radiusX: 4, radiusY: 4, force: 1, id: 1 }] },
+            sessionId,
+          ).catch(() => {});
+          for (let step = 1; step <= 4; step++) {
+            const curY = Math.round(sy + ((endY - sy) * step) / 4);
+            await this.sendCdp(
+              "Input.dispatchTouchEvent",
+              { type: "touchMove", touchPoints: [{ x: sx, y: curY, radiusX: 4, radiusY: 4, force: 1, id: 1 }] },
+              sessionId,
+            ).catch(() => {});
+          }
+          await this.sendCdp(
+            "Input.dispatchTouchEvent",
+            { type: "touchEnd", touchPoints: [] },
+            sessionId,
+          ).catch(() => {});
+        }
+        await new Promise((r) => setTimeout(r, 110));
+      } else if (
         params.clickXPct !== undefined &&
         params.clickYPct !== undefined &&
         this.pageSession
@@ -506,7 +590,7 @@ class ZeroPortPipeBrowser {
           },
           sessionId,
         );
-        await new Promise((r) => setTimeout(r, 90));
+        await new Promise((r) => setTimeout(r, 95));
       }
 
       // Re-measure full height & set exact viewport so full-page layout + hitBoxes match 1:1
@@ -515,7 +599,8 @@ class ZeroPortPipeBrowser {
         {
           expression: `(() => {
             const docW = Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0, window.innerWidth, 1);
-            const docH = Math.min(7600, Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, 520));
+            const rawScrollH = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, ${targetVpH});
+            const docH = Math.min(7600, rawScrollH);
             return { docW, docH };
           })()`,
           returnByValue: true,
@@ -524,7 +609,7 @@ class ZeroPortPipeBrowser {
       );
       const { docW, docH } = ((
         measureRes.result as { value?: { docW: number; docH: number } }
-      )?.value) ?? { docW: params.viewportWidth, docH: 900 };
+      )?.value) ?? { docW: params.viewportWidth, docH: targetVpH };
 
       const safeDpr = Math.min(2, Math.max(1, Math.floor((7200 / docH) * 10) / 10));
       await this.sendCdp(
@@ -539,7 +624,7 @@ class ZeroPortPipeBrowser {
       );
       await new Promise((r) => setTimeout(r, 35));
 
-      // Extract exact DOM HitBoxes in full-document percentage coordinates
+      // Extract exact DOM HitBoxes + currently visible [data-screen] names
       const hitRes = await this.sendCdp(
         "Runtime.evaluate",
         {
@@ -558,11 +643,49 @@ class ZeroPortPipeBrowser {
                 : [];
               return cls.length ? tag + "." + cls.join(".") : tag;
             };
+            const buildDomPath = (el, stopEl) => {
+              const parts = [];
+              let cur = el;
+              let depth = 0;
+              while (cur && cur.nodeType === 1 && cur !== document.documentElement && depth < 5) {
+                let seg = shortSel(cur);
+                if (!cur.id && cur.parentElement) {
+                  const sameTag = Array.from(cur.parentElement.children).filter((c) => c.tagName === cur.tagName);
+                  if (sameTag.length > 1) {
+                    seg += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+                  }
+                }
+                parts.unshift(seg);
+                if (cur === stopEl || cur === document.body) break;
+                cur = cur.parentElement;
+                depth += 1;
+              }
+              return parts.join(" > ");
+            };
+            const isHiddenChain = (el) => {
+              let cur = el;
+              while (cur && cur !== document.documentElement) {
+                const st = window.getComputedStyle(cur);
+                if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) return true;
+                if (cur.classList && (cur.classList.contains("hidden") || cur.classList.contains("hidden-el"))) return true;
+                cur = cur.parentElement;
+              }
+              return false;
+            };
+            const activeScreens = [];
+            for (const sEl of document.querySelectorAll("[data-screen]")) {
+              if (isHiddenChain(sEl)) continue;
+              const sr = sEl.getBoundingClientRect();
+              if (sr.width < 20 || sr.height < 20) continue;
+              const sName = clean(sEl.getAttribute("data-screen"), 80);
+              if (sName && !activeScreens.includes(sName)) activeScreens.push(sName);
+            }
+            const pageTitle = clean(document.title, 80);
+
             const nodes = document.querySelectorAll("[data-part], button, a, input, select, textarea, [role='button']");
             const boxes = [];
             for (const el of nodes) {
-              const st = window.getComputedStyle(el);
-              if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) continue;
+              if (isHiddenChain(el)) continue;
               const r = el.getBoundingClientRect();
               if (r.width < 8 || r.height < 8) continue;
               const pageLeft = r.left + window.scrollX;
@@ -570,7 +693,7 @@ class ZeroPortPipeBrowser {
               if (pageTop > docH || pageTop + r.height < 0) continue;
 
               const ds = el.closest("[data-screen]");
-              const screenName = ds ? (clean(ds.getAttribute("data-screen"), 70) || "画板") : (clean(document.title, 50) || "主画板");
+              const screenName = ds ? (clean(ds.getAttribute("data-screen"), 80) || "画板") : (pageTitle || "主画板");
               let sx = (pageLeft + r.width / 2) / docW * 100;
               let sy = (pageTop + r.height / 2) / docH * 100;
               if (ds) {
@@ -582,11 +705,14 @@ class ZeroPortPipeBrowser {
               }
 
               const partAttr = el.getAttribute("data-part");
-              const label = clean(partAttr || el.getAttribute("aria-label") || el.innerText || el.textContent || "", 56) || shortSel(el);
+              const rawText = clean(el.innerText || el.textContent || "", 84);
+              const label = clean(partAttr || el.getAttribute("aria-label") || rawText || "", 56) || shortSel(el);
               boxes.push({
                 screen: screenName,
                 part: label,
                 selector: shortSel(el),
+                domPath: buildDomPath(el, ds || document.body),
+                ...(rawText && rawText !== label ? { textSnippet: rawText } : {}),
                 xPct: Math.round((pageLeft / docW) * 1000) / 10,
                 yPct: Math.round((pageTop / docH) * 1000) / 10,
                 wPct: Math.round((r.width / docW) * 1000) / 10,
@@ -597,15 +723,19 @@ class ZeroPortPipeBrowser {
               });
               if (boxes.length >= 180) break;
             }
-            return boxes;
+            return { boxes, activeScreens, pageTitle };
           })()`,
           returnByValue: true,
         },
         sessionId,
       );
 
-      const hitBoxes = (((hitRes.result as { value?: DomHitBox[] })?.value) ??
-        []) as DomHitBox[];
+      const evalVal = ((hitRes.result as {
+        value?: { boxes?: DomHitBox[]; activeScreens?: string[]; pageTitle?: string };
+      })?.value) ?? {};
+      const hitBoxes = evalVal.boxes ?? [];
+      const activeScreens = evalVal.activeScreens ?? [];
+      const pageTitle = evalVal.pageTitle ?? "";
 
       const shotRes = await this.sendCdp(
         "Page.captureScreenshot",
@@ -630,6 +760,8 @@ class ZeroPortPipeBrowser {
         docWidth: docW,
         docHeight: docH,
         hitBoxes,
+        activeScreens,
+        pageTitle,
       };
     });
   }
@@ -644,23 +776,29 @@ export function disposeMobileRenderer(): void {
 export async function renderMobilePrototypeSnapshot(params: {
   resolvedPath: string;
   viewportWidth: number;
+  viewportHeight?: number;
   cleanChrome: boolean;
   clickXPct?: number;
   clickYPct?: number;
+  scrollDeltaY?: number;
+  scrollXPct?: number;
+  scrollYPct?: number;
   resetSession?: boolean;
 }): Promise<RenderMobilePrototypeOutput> {
-  const canonicalPath = resolvePrototypePath(params.resolvedPath, null);
-  const mtimeMs = Math.floor(statSync(canonicalPath).mtimeMs);
-  const rawHtml = await readFile(canonicalPath, "utf8");
-  const bundledHtml = await bundleLocalHtmlAssets(rawHtml, canonicalPath);
+  const { canonicalPath, bundledHtml, byteSize, mtimeMs } =
+    await getCachedBundledPrototype(params.resolvedPath, null);
   return singletonRenderer.renderOrInteract({
     resolvedPath: canonicalPath,
     bundledHtml,
-    modifiedAt: `${rawHtml.length}-${mtimeMs}`,
+    modifiedAt: `${byteSize}-${mtimeMs}`,
     viewportWidth: params.viewportWidth,
+    viewportHeight: params.viewportHeight ?? 520,
     cleanChrome: params.cleanChrome,
     clickXPct: params.clickXPct,
     clickYPct: params.clickYPct,
+    scrollDeltaY: params.scrollDeltaY,
+    scrollXPct: params.scrollXPct,
+    scrollYPct: params.scrollYPct,
     resetSession: params.resetSession,
   });
 }

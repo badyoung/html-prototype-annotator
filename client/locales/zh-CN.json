@@ -54,6 +54,17 @@
     "downloadA11y": "下载 HTML 原型 {{name}}",
     "downloadFailed": "下载 HTML 失败：{{error}}"
   },
+  "feedback": {
+    "approvedTitle": "原型确认通过 · {{name}}",
+    "changesTitle": "原型批注反馈 · {{name}}",
+    "approvedSubtitle": "无额外修改标注 · 确认推进实现",
+    "changesSubtitle": "共 {{count}} 处修改标注",
+    "changesWithScreens": "共 {{count}} 处修改标注 · 涉及 {{screens}} 个画板",
+    "reopenBtn": "查看画板",
+    "expandMore": "展开其余 {{count}} 条批注",
+    "collapseList": "收起批注列表",
+    "overallLabel": "整体补充说明"
+  },
   "save": {
     "startedDownload": "已开始下载 {{name}} ({{size}})",
     "openedShare": "已唤起系统保存面板：{{name}}"
@@ -116,6 +127,8 @@
     "toastSubmitFailed": "提交失败：{{error}}",
     "toastCopied": "已复制 Markdown 批注",
     "toastCopyFailed": "复制失败",
-    "toastInteractFailed": "触发交互失败：{{error}}"
+    "toastInteractFailed": "触发交互失败：{{error}}",
+    "sentBadge": "已发",
+    "clearSent": "清已发"
   }
 }

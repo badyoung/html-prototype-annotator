@@ -26,9 +26,34 @@ import {
   MAX_BUNDLED_ASSET_BYTES,
   MAX_PROTOTYPE_HTML_BYTES,
   MAX_TOTAL_BUNDLED_BYTES,
+  PROTOTYPE_HTML_CHUNK_CHARS,
   type LoadHtmlPrototypeOutput,
+  type ReadPrototypeHtmlChunkOutput,
   type SubmitPrototypeAnnotationsOutput,
 } from "../shared/rpc";
+
+interface BundledHtmlCacheEntry {
+  cacheKey: string;
+  bundledHtml: string;
+  rawHtml: string;
+  byteSize: number;
+  mtimeMs: number;
+  modifiedAt: string;
+  ts: number;
+}
+
+const bundledHtmlCache = new Map<string, BundledHtmlCacheEntry>();
+const MAX_BUNDLED_CACHE_ENTRIES = 4;
+
+function putBundledCache(canonicalPath: string, entry: BundledHtmlCacheEntry): void {
+  bundledHtmlCache.delete(canonicalPath);
+  bundledHtmlCache.set(canonicalPath, entry);
+  while (bundledHtmlCache.size > MAX_BUNDLED_CACHE_ENTRIES) {
+    const oldestKey = bundledHtmlCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    bundledHtmlCache.delete(oldestKey);
+  }
+}
 
 const ASSET_MIME_BY_EXT: Readonly<Record<string, string>> = {
   ".png": "image/png",
@@ -163,8 +188,9 @@ export async function bundleLocalHtmlAssets(
     }
   }
 
-  // 2. Inline local relative <img src="...">
-  const imgRe = /(<img\b[^>]*?\bsrc\s*=\s*)(?:"([^"]+)"|'([^']+)')([^>]*>)/gi;
+  // 2. Inline local relative <img src="..."> (skip data:/http:/blob: directly in regex so multi-MB Base64 tags cost ~0ms)
+  const imgRe =
+    /(<img\b[^>]*?\bsrc\s*=\s*)(?:"(?!(?:data:|https?:|blob:|\/\/))([^"]{1,2048})"|'(?!(?:data:|https?:|blob:|\/\/))([^']{1,2048})')([^>]*>)/gi;
   const imgMatches = [...result.matchAll(imgRe)];
   for (const m of imgMatches) {
     const fullTag = m[0];
@@ -213,11 +239,19 @@ export function getAnnotationSidecarPaths(resolvedHtmlPath: string): {
   };
 }
 
-export async function loadHtmlPrototype(params: {
-  rawPath: string;
-  cwd?: string | null;
-}): Promise<LoadHtmlPrototypeOutput> {
-  const candidatePath = resolvePrototypePath(params.rawPath, params.cwd);
+export async function getCachedBundledPrototype(
+  rawPath: string,
+  cwd?: string | null,
+): Promise<{
+  canonicalPath: string;
+  fileName: string;
+  rawHtml: string;
+  bundledHtml: string;
+  byteSize: number;
+  mtimeMs: number;
+  modifiedAt: string;
+}> {
+  const candidatePath = resolvePrototypePath(rawPath, cwd);
 
   let fileStat;
   try {
@@ -227,7 +261,9 @@ export async function loadHtmlPrototype(params: {
       throw new Error(`Prototype file not found on host: ${candidatePath}`);
     }
     if (hasErrorCode(err, "EACCES") || hasErrorCode(err, "EPERM")) {
-      throw new Error(`Permission denied reading prototype file: ${candidatePath}`);
+      throw new Error(
+        `Permission denied reading prototype file: ${candidatePath}`,
+      );
     }
     throw new Error(
       `Failed to read prototype file: ${err instanceof Error ? err.message : String(err)}`,
@@ -244,9 +280,65 @@ export async function loadHtmlPrototype(params: {
   }
 
   const canonicalPath = await realpath(candidatePath).catch(() => candidatePath);
-  const fileName = extractFileName(candidatePath) || extractFileName(canonicalPath);
+  const fileName =
+    extractFileName(candidatePath) || extractFileName(canonicalPath);
+  const mtimeMs = Math.floor(fileStat.mtimeMs);
+  const cacheKey = `${canonicalPath}|${fileStat.size}|${mtimeMs}`;
+
+  const hit = bundledHtmlCache.get(canonicalPath);
+  if (hit && hit.cacheKey === cacheKey) {
+    hit.ts = Date.now();
+    return {
+      canonicalPath,
+      fileName,
+      rawHtml: hit.rawHtml,
+      bundledHtml: hit.bundledHtml,
+      byteSize: hit.byteSize,
+      mtimeMs: hit.mtimeMs,
+      modifiedAt: hit.modifiedAt,
+    };
+  }
+
   const rawHtml = await readFile(canonicalPath, "utf8");
   const bundledHtml = await bundleLocalHtmlAssets(rawHtml, canonicalPath);
+  const modifiedAt = fileStat.mtime.toISOString();
+
+  putBundledCache(canonicalPath, {
+    cacheKey,
+    rawHtml,
+    bundledHtml,
+    byteSize: fileStat.size,
+    mtimeMs,
+    modifiedAt,
+    ts: Date.now(),
+  });
+
+  return {
+    canonicalPath,
+    fileName,
+    rawHtml,
+    bundledHtml,
+    byteSize: fileStat.size,
+    mtimeMs,
+    modifiedAt,
+  };
+}
+
+export async function loadHtmlPrototype(params: {
+  rawPath: string;
+  cwd?: string | null;
+  omitHtml?: boolean;
+  maxInlineChars?: number;
+}): Promise<LoadHtmlPrototypeOutput> {
+  const {
+    canonicalPath,
+    fileName,
+    rawHtml,
+    bundledHtml,
+    byteSize,
+    modifiedAt,
+  } = await getCachedBundledPrototype(params.rawPath, params.cwd);
+
   const semantics = extractSemanticTargetsFromHtml(rawHtml);
 
   let savedPins: AnnotationPin[] = [];
@@ -270,17 +362,58 @@ export async function loadHtmlPrototype(params: {
     // No saved draft yet
   }
 
+  const totalHtmlChars = bundledHtml.length;
+  let inlineSlice = bundledHtml;
+  let htmlComplete = true;
+
+  if (params.omitHtml) {
+    inlineSlice = "";
+    htmlComplete = totalHtmlChars === 0;
+  } else if (
+    params.maxInlineChars !== undefined &&
+    totalHtmlChars > params.maxInlineChars
+  ) {
+    inlineSlice = bundledHtml.slice(0, params.maxInlineChars);
+    htmlComplete = false;
+  }
+
   return {
     resolvedPath: canonicalPath,
     fileName,
     title: semantics.title || fileName,
-    byteSize: fileStat.size,
-    modifiedAt: fileStat.mtime.toISOString(),
-    bundledHtml,
+    byteSize,
+    modifiedAt,
+    bundledHtml: inlineSlice,
+    totalHtmlChars,
+    htmlComplete,
     semanticScreens: semantics.screens,
     semanticParts: semantics.parts,
     savedPins,
     savedOverallNote,
+  };
+}
+
+export async function readPrototypeHtmlChunk(params: {
+  resolvedPath: string;
+  offset: number;
+  maxChars?: number;
+}): Promise<ReadPrototypeHtmlChunkOutput> {
+  const { bundledHtml } = await getCachedBundledPrototype(
+    params.resolvedPath,
+    null,
+  );
+  const totalChars = bundledHtml.length;
+  const safeOffset = Math.min(Math.max(0, params.offset), totalChars);
+  const step = Math.max(
+    4096,
+    Math.min(4_000_000, params.maxChars ?? PROTOTYPE_HTML_CHUNK_CHARS),
+  );
+  const nextOffset = Math.min(totalChars, safeOffset + step);
+  return {
+    chunk: bundledHtml.slice(safeOffset, nextOffset),
+    nextOffset,
+    totalChars,
+    eof: nextOffset >= totalChars,
   };
 }
 
@@ -299,43 +432,67 @@ export async function submitPrototypeAnnotations(params: {
   const sidecar = getAnnotationSidecarPaths(canonicalPath);
   await mkdir(sidecar.dir, { recursive: true });
 
-  const markdown = formatAnnotationsMarkdown({
+  const unsentPins = params.pins.filter((p) => !p.sentAt);
+  const pinsForDelivery =
+    params.sendToAgent && unsentPins.length > 0 ? unsentPins : params.pins;
+
+  const deliveryMarkdown = formatAnnotationsMarkdown({
     fileName: params.fileName,
     resolvedPath: canonicalPath,
     savedMarkdownPath: sidecar.markdownPath,
-    pins: params.pins,
+    pins: pinsForDelivery,
     overallNote: params.overallNote,
     approvedAsIs: params.approvedAsIs,
     locale: params.locale,
   });
 
-  const payloadJson = {
-    updatedAt: new Date().toISOString(),
-    prototypePath: canonicalPath,
-    fileName: params.fileName,
-    approvedAsIs: Boolean(params.approvedAsIs),
-    overallNote: params.overallNote ?? "",
-    pins: params.pins,
-  };
-
-  await writeFile(sidecar.jsonPath, `${JSON.stringify(payloadJson, null, 2)}\n`, "utf8");
-  await writeFile(sidecar.markdownPath, `${markdown}\n`, "utf8");
+  const fullArchiveMarkdown =
+    pinsForDelivery.length === params.pins.length
+      ? deliveryMarkdown
+      : formatAnnotationsMarkdown({
+          fileName: params.fileName,
+          resolvedPath: canonicalPath,
+          savedMarkdownPath: sidecar.markdownPath,
+          pins: params.pins,
+          overallNote: params.overallNote,
+          approvedAsIs: params.approvedAsIs,
+          locale: params.locale,
+        });
 
   const targetAgentId = params.agentId?.trim() || null;
   let sentToAgent = false;
 
   if (params.sendToAgent && targetAgentId) {
-    await params.paseo.agents.ref(targetAgentId).send(markdown, {
+    await params.paseo.agents.ref(targetAgentId).send(deliveryMarkdown, {
       activeTurnBehavior: "steer",
     });
     sentToAgent = true;
   }
 
+  const stampedNow = new Date().toISOString();
+  const nextPins: AnnotationPin[] = sentToAgent
+    ? params.pins.map((p) => (p.sentAt ? p : { ...p, sentAt: stampedNow }))
+    : [...params.pins];
+
+  const payloadJson = {
+    updatedAt: stampedNow,
+    prototypePath: canonicalPath,
+    fileName: params.fileName,
+    approvedAsIs: Boolean(params.approvedAsIs),
+    overallNote: params.overallNote ?? "",
+    pins: nextPins,
+  };
+
+  await writeFile(sidecar.jsonPath, `${JSON.stringify(payloadJson, null, 2)}\n`, "utf8");
+  await writeFile(sidecar.markdownPath, `${fullArchiveMarkdown}\n`, "utf8");
+
   return {
     savedJsonPath: sidecar.jsonPath,
     savedMarkdownPath: sidecar.markdownPath,
-    markdown,
+    markdown: deliveryMarkdown,
     sentToAgent,
     targetAgentId,
+    sentCount: sentToAgent ? pinsForDelivery.length : 0,
+    updatedPins: nextPins,
   };
 }

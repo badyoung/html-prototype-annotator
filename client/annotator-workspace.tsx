@@ -25,7 +25,10 @@ import {
 } from "../shared/annotations";
 import { instrumentHtmlForWebAnnotator } from "../shared/html-instrumenter";
 import {
+  assembleFullPrototypeHtml,
   loadHtmlPrototypeRpc,
+  PROTOTYPE_HTML_CHUNK_CHARS,
+  readPrototypeHtmlChunkRpc,
   renderMobilePrototypeRpc,
   submitPrototypeAnnotationsRpc,
   type DomHitBox,
@@ -106,13 +109,21 @@ function matchEnclosedHitParts(
   top: number,
   width: number,
   height: number,
-): { screen: string | null; part: string | null } {
+): {
+  screen: string | null;
+  part: string | null;
+  selector?: string;
+  domPath?: string;
+  textSnippet?: string;
+} {
   const names: string[] = [];
   let screen: string | null = null;
+  let firstHit: DomHitBox | null = null;
   for (const b of hitBoxes) {
     const cx = b.xPct + b.wPct / 2;
     const cy = b.yPct + b.hPct / 2;
     if (cx >= left && cx <= left + width && cy >= top && cy <= top + height) {
+      if (!firstHit) firstHit = b;
       if (!screen && b.screen) screen = b.screen;
       if (b.part && !names.includes(b.part)) {
         names.push(b.part);
@@ -123,6 +134,74 @@ function matchEnclosedHitParts(
   return {
     screen,
     part: names.length > 0 ? names.join(" + ") : null,
+    selector: firstHit?.selector,
+    domPath: firstHit?.domPath,
+    textSnippet: firstHit?.textSnippet,
+  };
+}
+
+function normalizeScreenPrefix(screen: string): string {
+  return (screen.split("·")[0] ?? "").trim();
+}
+
+function isPinOnActiveMobileScreen(
+  pin: AnnotationPin,
+  shot: RenderMobilePrototypeOutput,
+  isActivePin: boolean,
+): boolean {
+  if (isActivePin) return true;
+  const screens = shot.activeScreens ?? [];
+  if (screens.length === 0) return true;
+  const pinScreen = pin.screen.trim();
+  const pinPrefix = normalizeScreenPrefix(pinScreen);
+  for (const s of screens) {
+    const cleanS = s.trim();
+    if (cleanS === pinScreen) return true;
+    const activePrefix = normalizeScreenPrefix(cleanS);
+    if (activePrefix && pinPrefix && activePrefix === pinPrefix) {
+      return true;
+    }
+  }
+  if (shot.pageTitle && pinScreen === shot.pageTitle.trim()) {
+    return true;
+  }
+  return false;
+}
+
+function resolveMobilePinGeometry(
+  pin: AnnotationPin,
+  effectiveMobileW: number,
+): { cx: number; cy: number; cw?: number; ch?: number } {
+  if (pin.canvasXPct !== undefined && pin.canvasYPct !== undefined) {
+    return {
+      cx: pin.canvasXPct,
+      cy: pin.canvasYPct,
+      cw: pin.canvasWPct ?? pin.wPct,
+      ch: pin.canvasHPct ?? pin.hPct,
+    };
+  }
+  // Remap legacy desktop-centered phone-frame body selections onto narrow mobile screen
+  const rightEdge = pin.xPct + (pin.wPct ?? 0);
+  if (
+    effectiveMobileW <= 480 &&
+    pin.selector === "body" &&
+    pin.xPct >= 24 &&
+    pin.xPct <= 40 &&
+    rightEdge >= 60 &&
+    rightEdge <= 78
+  ) {
+    return {
+      cx: clampPct(((pin.xPct - 29.5) / 41) * 100),
+      cy: clampPct(((pin.yPct - 5) / 90) * 100),
+      cw: pin.wPct !== undefined ? clampPct((pin.wPct / 41) * 100) : undefined,
+      ch: pin.hPct !== undefined ? clampPct((pin.hPct / 90) * 100) : undefined,
+    };
+  }
+  return {
+    cx: pin.xPct,
+    cy: pin.yPct,
+    cw: pin.wPct,
+    ch: pin.hPct,
   };
 }
 
@@ -165,8 +244,9 @@ export function PrototypeAnnotatorWorkspace({
   const { t, locale } = useProtoI18n();
   const prefState = useSettings(prototypeAnnotatorSettings);
   const toast = useToast();
-  const { width: winWidth } = useWindowDimensions();
+  const { width: winWidth, height: winHeight } = useWindowDimensions();
   const loadPrototype = useRpc(loadHtmlPrototypeRpc);
+  const readPrototypeChunk = useRpc(readPrototypeHtmlChunkRpc);
   const renderMobilePrototype = useRpc(renderMobilePrototypeRpc);
   const submitAnnotations = useRpc(submitPrototypeAnnotationsRpc);
 
@@ -180,6 +260,11 @@ export function PrototypeAnnotatorWorkspace({
   const [mobileRendering, setMobileRendering] = useState(false);
   const [mobileInteracting, setMobileInteracting] = useState(false);
   const [mobileCanvasWidth, setMobileCanvasWidth] = useState(0);
+  const [mobileStageHeight, setMobileStageHeight] = useState(0);
+  const stageSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const lastRenderedVpRef = useRef<{ path: string; w: number; h: number } | null>(
+    null,
+  );
 
   const [mode, setMode] = useState<AnnotatorMode>("interact");
   const modeSeededRef = useRef(false);
@@ -212,8 +297,11 @@ export function PrototypeAnnotatorWorkspace({
   const tapStartRef = useRef<{
     pageX: number;
     pageY: number;
+    lastPageX: number;
+    lastPageY: number;
     locX: number;
     locY: number;
+    moved: boolean;
     ts: number;
   } | null>(null);
 
@@ -226,6 +314,21 @@ export function PrototypeAnnotatorWorkspace({
   const isNarrowLayout = compact || winWidth < 900;
   const darkTheme = isDarkSurface(theme.colors.surface0);
   const canvasBackdrop = darkTheme ? "#0D1017" : "#EEF1F4";
+
+  const fallbackStageW = Math.min(winWidth || 390, 540);
+  const fallbackStageH = Math.max(
+    560,
+    Math.round((stageHeight || winHeight || 844) - (compact ? 148 : 88)),
+  );
+  const effectiveMobileW = Math.max(1, mobileCanvasWidth || fallbackStageW);
+  const targetMobileVpW = Math.max(
+    320,
+    Math.min(1440, Math.round(mobileCanvasWidth || fallbackStageW)),
+  );
+  const targetMobileVpH = Math.max(
+    560,
+    Math.min(2400, Math.round(mobileStageHeight || fallbackStageH)),
+  );
 
   useEffect(() => {
     setSidebarOpen(!isNarrowLayout);
@@ -246,20 +349,58 @@ export function PrototypeAnnotatorWorkspace({
         const loaded = await loadPrototype({
           rawPath: trimmed,
           cwd: cwd ?? null,
+          omitHtml: platform !== "web",
+          maxInlineChars: PROTOTYPE_HTML_CHUNK_CHARS,
         });
         if (cancelled) return;
-        setProto(loaded);
-        setPins(loaded.savedPins ?? []);
-        setOverallNote(loaded.savedOverallNote ?? "");
-        setShowGlobalNote(Boolean(loaded.savedOverallNote?.trim()));
-        setActivePinId(loaded.savedPins?.[0]?.id ?? null);
+
+        let finalProto = loaded;
+        if (platform === "web" && !loaded.htmlComplete) {
+          const fullHtml = await assembleFullPrototypeHtml(
+            loaded,
+            readPrototypeChunk,
+            () => cancelled,
+          );
+          if (cancelled) return;
+          finalProto = {
+            ...loaded,
+            bundledHtml: fullHtml,
+            htmlComplete: true,
+          };
+        }
+
+        setProto(finalProto);
+        setPins(finalProto.savedPins ?? []);
+        setOverallNote(finalProto.savedOverallNote ?? "");
+        setShowGlobalNote(Boolean(finalProto.savedOverallNote?.trim()));
+        setActivePinId(null);
 
         if (platform !== "web") {
           setMobileRendering(true);
           try {
+            const initW = Math.max(
+              320,
+              Math.min(
+                1440,
+                Math.round(stageSizeRef.current.w || fallbackStageW),
+              ),
+            );
+            const initH = Math.max(
+              560,
+              Math.min(
+                2400,
+                Math.round(stageSizeRef.current.h || fallbackStageH),
+              ),
+            );
+            lastRenderedVpRef.current = {
+              path: loaded.resolvedPath,
+              w: initW,
+              h: initH,
+            };
             const snap = await renderMobilePrototype({
               resolvedPath: loaded.resolvedPath,
-              viewportWidth: 414,
+              viewportWidth: initW,
+              viewportHeight: initH,
               cleanChrome: true,
               resetSession: true,
             });
@@ -289,6 +430,62 @@ export function PrototypeAnnotatorWorkspace({
       cancelled = true;
     };
   }, [rawPath, cwd, platform]);
+
+  useEffect(() => {
+    if (
+      platform === "web" ||
+      !proto ||
+      loading ||
+      mobileRendering ||
+      mobileInteracting ||
+      mobileCanvasWidth <= 0 ||
+      mobileStageHeight <= 0
+    ) {
+      return;
+    }
+    const prev = lastRenderedVpRef.current;
+    if (
+      prev &&
+      prev.path === proto.resolvedPath &&
+      (Math.abs(prev.w - targetMobileVpW) > 8 ||
+        Math.abs(prev.h - targetMobileVpH) > 16)
+    ) {
+      lastRenderedVpRef.current = {
+        path: proto.resolvedPath,
+        w: targetMobileVpW,
+        h: targetMobileVpH,
+      };
+      let cancelled = false;
+      setMobileInteracting(true);
+      void renderMobilePrototype({
+        resolvedPath: proto.resolvedPath,
+        viewportWidth: targetMobileVpW,
+        viewportHeight: targetMobileVpH,
+        cleanChrome,
+      })
+        .then((snap) => {
+          if (!cancelled) setMobileShot(snap);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setMobileInteracting(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [
+    platform,
+    proto,
+    loading,
+    mobileRendering,
+    mobileInteracting,
+    mobileCanvasWidth,
+    mobileStageHeight,
+    targetMobileVpW,
+    targetMobileVpH,
+    cleanChrome,
+  ]);
 
   const instrumentedHtml = useMemo(() => {
     if (!proto?.bundledHtml || platform !== "web") return "";
@@ -329,7 +526,11 @@ export function PrototypeAnnotatorWorkspace({
         const targetId = d.id;
         const nextNote = d.note;
         setPins((prev) =>
-          prev.map((p) => (p.id === targetId ? { ...p, note: nextNote } : p)),
+          prev.map((p) =>
+            p.id === targetId
+              ? { ...p, note: nextNote, sentAt: undefined }
+              : p,
+          ),
         );
         return;
       }
@@ -354,6 +555,10 @@ export function PrototypeAnnotatorWorkspace({
           ),
           part: String(rawDraft.part || t("studio.defaultElement")),
           selector: rawDraft.selector ? String(rawDraft.selector) : undefined,
+          domPath: rawDraft.domPath ? String(rawDraft.domPath) : undefined,
+          textSnippet: rawDraft.textSnippet
+            ? String(rawDraft.textSnippet)
+            : undefined,
           xPct: clampPct(Number(rawDraft.xPct ?? 50)),
           yPct: clampPct(Number(rawDraft.yPct ?? 50)),
           wPct:
@@ -403,7 +608,17 @@ export function PrototypeAnnotatorWorkspace({
   const activePin = activePinIndex >= 0 ? pins[activePinIndex] : null;
 
   const updatePin = (id: string, patch: Partial<AnnotationPin>) => {
-    setPins((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+    setPins((prev) =>
+      prev.map((p) =>
+        p.id === id
+          ? {
+              ...p,
+              ...patch,
+              ...(patch.note !== undefined ? { sentAt: undefined } : {}),
+            }
+          : p,
+      ),
+    );
   };
 
   const removePin = (id: string) => {
@@ -432,11 +647,17 @@ export function PrototypeAnnotatorWorkspace({
         locale,
       });
 
+      if (res.updatedPins) {
+        setPins(res.updatedPins);
+      }
+
       if (sendToAgent) {
         if (res.sentToAgent) {
           toast.show(
             pins.length > 0
-              ? t("studio.toastSentPins", { count: pins.length })
+              ? t("studio.toastSentPins", {
+                  count: res.sentCount || pins.length,
+                })
               : t("studio.toastSentApproved"),
             { variant: "success" },
           );
@@ -461,6 +682,23 @@ export function PrototypeAnnotatorWorkspace({
     }
   };
 
+  const handleExportCurrentHtml = async () => {
+    if (!proto) return;
+    try {
+      const fullHtml = proto.htmlComplete
+        ? proto.bundledHtml
+        : await assembleFullPrototypeHtml(proto, readPrototypeChunk);
+      const msg = await saveHtmlStringToDevice(fullHtml, proto.fileName, {
+        startedDownload: (name, size) =>
+          t("save.startedDownload", { name, size }),
+        openedShare: (name) => t("save.openedShare", { name }),
+      });
+      toast.show(msg, { variant: "success" });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const handleCopyMarkdown = async () => {
     if (!proto) return;
     const md = formatAnnotationsMarkdown({
@@ -480,17 +718,42 @@ export function PrototypeAnnotatorWorkspace({
   };
 
   // Computed scaled image dimensions on Mobile Native
-  const effectiveMobileW = Math.max(
-    1,
-    mobileCanvasWidth || Math.min(winWidth, 540),
-  );
   const effectiveMobileH = useMemo(() => {
-    if (!mobileShot) return 640;
+    if (!mobileShot) return targetMobileVpH;
     return Math.max(
       200,
       Math.round(effectiveMobileW * (mobileShot.docHeight / mobileShot.docWidth)),
     );
-  }, [mobileShot, effectiveMobileW]);
+  }, [mobileShot, effectiveMobileW, targetMobileVpH]);
+
+  const isFixedScreenProto = Boolean(
+    mobileShot && mobileShot.docHeight <= targetMobileVpH + 16,
+  );
+
+  const handleMobileSwipe = async (
+    scrollDeltaY: number,
+    scrollXPct: number,
+    scrollYPct: number,
+  ) => {
+    if (!proto || !mobileShot || mobileInteracting) return;
+    setMobileInteracting(true);
+    try {
+      const updated = await renderMobilePrototype({
+        resolvedPath: proto.resolvedPath,
+        viewportWidth: targetMobileVpW,
+        viewportHeight: targetMobileVpH,
+        cleanChrome,
+        scrollDeltaY,
+        scrollXPct,
+        scrollYPct,
+      });
+      setMobileShot(updated);
+    } catch {
+      // Ignore transient swipe errors
+    } finally {
+      setMobileInteracting(false);
+    }
+  };
 
   const handleMobileTapAt = async (canvasXPct: number, canvasYPct: number) => {
     if (!proto || !mobileShot) return;
@@ -501,7 +764,8 @@ export function PrototypeAnnotatorWorkspace({
       try {
         const updated = await renderMobilePrototype({
           resolvedPath: proto.resolvedPath,
-          viewportWidth: 414,
+          viewportWidth: targetMobileVpW,
+          viewportHeight: targetMobileVpH,
           cleanChrome,
           clickXPct: canvasXPct,
           clickYPct: canvasYPct,
@@ -525,11 +789,14 @@ export function PrototypeAnnotatorWorkspace({
       kind: "pin",
       screen:
         hit?.screen ||
+        mobileShot.activeScreens?.[0] ||
         proto.semanticScreens?.[0] ||
         proto.title ||
         t("studio.defaultScreen"),
       part: hit?.part || t("studio.defaultElement"),
       selector: hit?.selector,
+      domPath: hit?.domPath,
+      textSnippet: hit?.textSnippet,
       xPct: hit ? hit.screenXPct : canvasXPct,
       yPct: hit ? hit.screenYPct : canvasYPct,
       canvasXPct,
@@ -551,8 +818,11 @@ export function PrototypeAnnotatorWorkspace({
     tapStartRef.current = {
       pageX,
       pageY,
+      lastPageX: pageX,
+      lastPageY: pageY,
       locX: locationX,
       locY: locationY,
+      moved: false,
       ts: Date.now(),
     };
   };
@@ -568,11 +838,12 @@ export function PrototypeAnnotatorWorkspace({
       return;
     }
     if (tapStartRef.current) {
+      tapStartRef.current.lastPageX = ev.nativeEvent.pageX;
+      tapStartRef.current.lastPageY = ev.nativeEvent.pageY;
       const dx = ev.nativeEvent.pageX - tapStartRef.current.pageX;
       const dy = ev.nativeEvent.pageY - tapStartRef.current.pageY;
       if (Math.hypot(dx, dy) > 10) {
-        // User is scrolling vertically; cancel tap!
-        tapStartRef.current = null;
+        tapStartRef.current.moved = true;
       }
     }
   };
@@ -601,10 +872,14 @@ export function PrototypeAnnotatorWorkspace({
         kind: "box",
         screen:
           enclosed.screen ||
+          mobileShot.activeScreens?.[0] ||
           proto.semanticScreens?.[0] ||
           proto.title ||
           t("studio.defaultScreen"),
         part: enclosed.part || t("studio.defaultRegion"),
+        selector: enclosed.selector,
+        domPath: enclosed.domPath,
+        textSnippet: enclosed.textSnippet,
         xPct: left,
         yPct: top,
         wPct: w,
@@ -622,7 +897,20 @@ export function PrototypeAnnotatorWorkspace({
 
     const start = tapStartRef.current;
     tapStartRef.current = null;
-    if (!start || Date.now() - start.ts > 1500) return;
+    if (!start) return;
+    if (start.moved) {
+      if (mode === "interact" && isFixedScreenProto) {
+        const dx = start.lastPageX - start.pageX;
+        const dy = start.lastPageY - start.pageY;
+        if (Math.abs(dy) >= 24 && Math.abs(dy) > Math.abs(dx) * 1.15) {
+          const sxPct = clampPct((start.locX / effectiveMobileW) * 100);
+          const syPct = clampPct((start.locY / effectiveMobileH) * 100);
+          void handleMobileSwipe(Math.round(-dy * 1.35), sxPct, syPct);
+        }
+      }
+      return;
+    }
+    if (Date.now() - start.ts > 1500) return;
     const xPct = clampPct((start.locX / effectiveMobileW) * 100);
     const yPct = clampPct((start.locY / effectiveMobileH) * 100);
     void handleMobileTapAt(xPct, yPct);
@@ -648,7 +936,12 @@ export function PrototypeAnnotatorWorkspace({
       <Pressable
         key={id}
         accessibilityRole="button"
-        onPress={() => setMode(id)}
+        onPress={() => {
+          setMode(id);
+          if (id === "interact") {
+            setActivePinId(null);
+          }
+        }}
         style={({ pressed }) => ({
           flexDirection: "row",
           alignItems: "center",
@@ -722,6 +1015,12 @@ export function PrototypeAnnotatorWorkspace({
     </Pressable>
   );
 
+  const unsentPinsCount = useMemo(
+    () => pins.filter((p) => !p.sentAt).length,
+    [pins],
+  );
+  const pendingSendCount = unsentPinsCount > 0 ? unsentPinsCount : pins.length;
+  const hasSentPins = unsentPinsCount < pins.length;
   const hasFeedback = pins.length > 0 || Boolean(overallNote.trim());
   const isBusyLoading = loading || (platform !== "web" && mobileRendering);
 
@@ -1010,19 +1309,7 @@ export function PrototypeAnnotatorWorkspace({
                 "Download",
                 t("studio.downloadHtml", { size: formatByteSize(proto.byteSize) }),
                 () => {
-                  void saveHtmlStringToDevice(
-                    proto.bundledHtml,
-                    proto.fileName,
-                    {
-                      startedDownload: (name, size) =>
-                        t("save.startedDownload", { name, size }),
-                      openedShare: (name) => t("save.openedShare", { name }),
-                    },
-                  )
-                    .then((msg) => toast.show(msg, { variant: "success" }))
-                    .catch((e) =>
-                      toast.error(e instanceof Error ? e.message : String(e)),
-                    );
+                  void handleExportCurrentHtml();
                 },
               )
             : null}
@@ -1078,7 +1365,7 @@ export function PrototypeAnnotatorWorkspace({
                       : t("studio.approveBtn")
                   : t("studio.saveOnly")}
             </Text>
-            {pins.length > 0 ? (
+            {pendingSendCount > 0 ? (
               <View
                 style={{
                   paddingHorizontal: 5,
@@ -1094,7 +1381,7 @@ export function PrototypeAnnotatorWorkspace({
                     color: "#FFFFFF",
                   }}
                 >
-                  {pins.length}
+                  {pendingSendCount}
                 </Text>
               </View>
             ) : null}
@@ -1243,8 +1530,19 @@ export function PrototypeAnnotatorWorkspace({
           onLayout={
             platform !== "web"
               ? (ev: LayoutChangeEvent) => {
-                  const w = ev.nativeEvent.layout.width;
-                  if (w > 0) setMobileCanvasWidth(w);
+                  const { width: w, height: h } = ev.nativeEvent.layout;
+                  if (w > 0) {
+                    stageSizeRef.current.w = w;
+                    setMobileCanvasWidth((prev) =>
+                      Math.abs(prev - w) > 1 ? w : prev,
+                    );
+                  }
+                  if (h > 0 && !sidebarOpen && !activePinId) {
+                    stageSizeRef.current.h = h;
+                    setMobileStageHeight((prev) =>
+                      Math.abs(prev - h) > 1 ? h : prev,
+                    );
+                  }
                 }
               : undefined
           }
@@ -1331,13 +1629,25 @@ export function PrototypeAnnotatorWorkspace({
             <View style={{ flex: 1, width: "100%" }}>
               <ScrollView
                 style={{ flex: 1 }}
-                scrollEnabled={mode !== "box"}
+                scrollEnabled={
+                  mode !== "box" &&
+                  !(
+                    mode === "interact" &&
+                    isFixedScreenProto &&
+                    !sidebarOpen &&
+                    !activePin
+                  )
+                }
                 showsVerticalScrollIndicator
               >
                 <View
                   onTouchStart={onMobileImageTouchStart}
                   onTouchMove={onMobileImageTouchMove}
                   onTouchEnd={onMobileImageTouchEnd}
+                  onTouchCancel={() => {
+                    tapStartRef.current = null;
+                    setNativeDragRect(null);
+                  }}
                   style={{
                     width: effectiveMobileW,
                     height: effectiveMobileH,
@@ -1373,7 +1683,9 @@ export function PrototypeAnnotatorWorkspace({
                     />
                   ) : null}
 
-                  {/* Anchored Pins & Boxes on full scrollable Mobile Canvas (pointerEvents: none in interact mode) */}
+                  {/* Anchored Pins & Boxes on Mobile Canvas:
+                      - In 'interact' mode: completely hidden unless user explicitly selected an activePin to inspect
+                      - In 'pin'/'box' mode: filtered to active [data-screen]; inactive boxes show compact #N pills instead of overlapping dashed spiderwebs */}
                   <View
                     pointerEvents={mode === "interact" ? "none" : "box-none"}
                     style={{
@@ -1382,45 +1694,86 @@ export function PrototypeAnnotatorWorkspace({
                       right: 0,
                       bottom: 0,
                       left: 0,
-                      opacity: mode === "interact" ? 0.45 : 1,
                     }}
                   >
-                  {pins.map((p, idx) => {
-                    const isAct = p.id === activePinId;
-                    const cx = p.canvasXPct ?? p.xPct;
-                    const cy = p.canvasYPct ?? p.yPct;
-                    const cw = p.canvasWPct ?? p.wPct;
-                    const ch = p.canvasHPct ?? p.hPct;
+                    {pins.map((p, idx) => {
+                      const isAct = p.id === activePinId;
+                      if (mode === "interact" && !isAct) {
+                        return null;
+                      }
+                      if (!isPinOnActiveMobileScreen(p, mobileShot, isAct)) {
+                        return null;
+                      }
 
-                    if (p.kind === "box" && cw && ch) {
-                      return (
-                        <Pressable
-                          key={p.id}
-                          onPress={() => setActivePinId(p.id)}
-                          style={{
-                            position: "absolute",
-                            left: `${cx}%`,
-                            top: `${cy}%`,
-                            width: `${cw}%`,
-                            height: `${ch}%`,
-                            borderWidth: 1.5,
-                            borderStyle: isAct ? "solid" : "dashed",
-                            borderColor: isAct ? "#10B981" : "#F97316",
-                            backgroundColor: isAct
-                              ? "rgba(16,185,129,0.13)"
-                              : "rgba(249,115,22,0.1)",
-                            borderRadius: 10,
-                          }}
-                        >
-                          <View
+                      const { cx, cy, cw, ch } = resolveMobilePinGeometry(
+                        p,
+                        effectiveMobileW,
+                      );
+
+                      if (p.kind === "box" && cw && ch && isAct) {
+                        const tagInside = cy < 3.5;
+                        return (
+                          <Pressable
+                            key={p.id}
+                            onPress={() => setActivePinId(p.id)}
                             style={{
                               position: "absolute",
-                              top: -11,
-                              left: -2,
-                              paddingHorizontal: 6,
-                              height: 20,
+                              left: `${cx}%`,
+                              top: `${cy}%`,
+                              width: `${cw}%`,
+                              height: `${ch}%`,
+                              borderWidth: 1.8,
+                              borderStyle: "solid",
+                              borderColor: "#10B981",
+                              backgroundColor: "rgba(16,185,129,0.12)",
+                              borderRadius: 10,
+                            }}
+                          >
+                            <View
+                              style={{
+                                position: "absolute",
+                                top: tagInside ? 4 : -11,
+                                left: tagInside ? 4 : -2,
+                                paddingHorizontal: 6,
+                                height: 20,
+                                borderRadius: 999,
+                                backgroundColor: "#10B981",
+                                borderWidth: 2,
+                                borderColor: "#FFFFFF",
+                                alignItems: "center",
+                                justifyContent: "center",
+                              }}
+                            >
+                              <Text
+                                style={{
+                                  color: "#FFFFFF",
+                                  fontSize: 10.5,
+                                  fontWeight: "800",
+                                }}
+                              >
+                                #{idx + 1}
+                              </Text>
+                            </View>
+                          </Pressable>
+                        );
+                      }
+
+                      if (p.kind === "box") {
+                        const pillX = Math.max(1.5, Math.min(89, cx));
+                        const pillY = Math.max(1.5, Math.min(94, cy));
+                        return (
+                          <Pressable
+                            key={p.id}
+                            onPress={() => setActivePinId(p.id)}
+                            style={{
+                              position: "absolute",
+                              left: `${pillX}%`,
+                              top: `${pillY}%`,
+                              paddingHorizontal: 6.5,
+                              height: 22,
                               borderRadius: 999,
-                              backgroundColor: isAct ? "#10B981" : "#F97316",
+                              backgroundColor: p.sentAt ? "#64748B" : "#F97316",
+                              opacity: p.sentAt ? 0.8 : 1,
                               borderWidth: 2,
                               borderColor: "#FFFFFF",
                               alignItems: "center",
@@ -1436,43 +1789,49 @@ export function PrototypeAnnotatorWorkspace({
                             >
                               #{idx + 1}
                             </Text>
-                          </View>
-                        </Pressable>
-                      );
-                    }
+                          </Pressable>
+                        );
+                      }
 
-                    return (
-                      <Pressable
-                        key={p.id}
-                        onPress={() => setActivePinId(p.id)}
-                        style={{
-                          position: "absolute",
-                          left: `${cx}%`,
-                          top: `${cy}%`,
-                          marginLeft: -13,
-                          marginTop: -13,
-                          width: 26,
-                          height: 26,
-                          borderRadius: 13,
-                          backgroundColor: isAct ? "#10B981" : "#F97316",
-                          borderWidth: 2,
-                          borderColor: "#FFFFFF",
-                          alignItems: "center",
-                          justifyContent: "center",
-                        }}
-                      >
-                        <Text
+                      const pinX = Math.max(3.5, Math.min(96.5, cx));
+                      const pinY = Math.max(2.5, Math.min(96.5, cy));
+                      return (
+                        <Pressable
+                          key={p.id}
+                          onPress={() => setActivePinId(p.id)}
                           style={{
-                            color: "#FFFFFF",
-                            fontSize: 11.5,
-                            fontWeight: "800",
+                            position: "absolute",
+                            left: `${pinX}%`,
+                            top: `${pinY}%`,
+                            marginLeft: -13,
+                            marginTop: -13,
+                            width: 26,
+                            height: 26,
+                            borderRadius: 13,
+                            backgroundColor: isAct
+                              ? "#10B981"
+                              : p.sentAt
+                                ? "#64748B"
+                                : "#F97316",
+                            opacity: !isAct && p.sentAt ? 0.8 : 1,
+                            borderWidth: 2,
+                            borderColor: "#FFFFFF",
+                            alignItems: "center",
+                            justifyContent: "center",
                           }}
                         >
-                          {idx + 1}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
+                          <Text
+                            style={{
+                              color: "#FFFFFF",
+                              fontSize: 11.5,
+                              fontWeight: "800",
+                            }}
+                          >
+                            {idx + 1}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
                   </View>
                 </View>
               </ScrollView>
@@ -1555,21 +1914,7 @@ export function PrototypeAnnotatorWorkspace({
                   <Pressable
                     accessibilityRole="button"
                     onPress={() => {
-                      void saveHtmlStringToDevice(
-                        proto.bundledHtml,
-                        proto.fileName,
-                        {
-                          startedDownload: (name, size) =>
-                            t("save.startedDownload", { name, size }),
-                          openedShare: (name) => t("save.openedShare", { name }),
-                        },
-                      )
-                        .then((msg) => toast.show(msg, { variant: "success" }))
-                        .catch((e) =>
-                          toast.error(
-                            e instanceof Error ? e.message : String(e),
-                          ),
-                        );
+                      void handleExportCurrentHtml();
                     }}
                   >
                     <Text
@@ -1600,6 +1945,26 @@ export function PrototypeAnnotatorWorkspace({
                     {t("studio.globalNoteToggle")}
                   </Text>
                 </Pressable>
+
+                {hasSentPins ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => {
+                      setPins((prev) => prev.filter((p) => !p.sentAt));
+                      setActivePinId(null);
+                    }}
+                  >
+                    <Text
+                      style={{
+                        fontSize: 11.5,
+                        fontWeight: "600",
+                        color: theme.colors.foregroundMuted,
+                      }}
+                    >
+                      {t("studio.clearSent")}
+                    </Text>
+                  </Pressable>
+                ) : null}
 
                 {pins.length > 0 ? (
                   <Pressable
@@ -1771,7 +2136,11 @@ export function PrototypeAnnotatorWorkspace({
                               height: 20,
                               paddingHorizontal: 5,
                               borderRadius: 999,
-                              backgroundColor: isAct ? "#10B981" : "#F97316",
+                              backgroundColor: isAct
+                                ? "#10B981"
+                                : pin.sentAt
+                                  ? "#64748B"
+                                  : "#F97316",
                               alignItems: "center",
                               justifyContent: "center",
                             }}
@@ -1797,6 +2166,26 @@ export function PrototypeAnnotatorWorkspace({
                           >
                             {pin.part}
                           </Text>
+                          {pin.sentAt ? (
+                            <View
+                              style={{
+                                paddingHorizontal: 5,
+                                paddingVertical: 1,
+                                borderRadius: 4,
+                                backgroundColor: theme.colors.surface2,
+                              }}
+                            >
+                              <Text
+                                style={{
+                                  fontSize: 10,
+                                  fontWeight: "600",
+                                  color: theme.colors.foregroundMuted,
+                                }}
+                              >
+                                {t("studio.sentBadge")}
+                              </Text>
+                            </View>
+                          ) : null}
                         </View>
 
                         <Pressable
@@ -1913,7 +2302,9 @@ export function PrototypeAnnotatorWorkspace({
                 >
                   {agentId
                     ? hasFeedback
-                      ? t("studio.sendCountToAgent", { count: pins.length })
+                      ? t("studio.sendCountToAgent", {
+                          count: pendingSendCount,
+                        })
                       : t("studio.approveNotify")
                     : t("studio.saveAndCopy")}
                 </Text>

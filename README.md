@@ -12,10 +12,10 @@ When collaborating with coding agents on new screens, layout revamps, or multi-s
 
 Prototype Annotator closes that loop inside Paseo:
 
-1. **Zero-port encrypted transport**: reads `.html`/`.htm` on the daemon host and inlines relative `<link rel="stylesheet">` and `<img>` assets automatically—works seamlessly over Desktop, Web, Paseo Relay, Cloudflare Tunnel, Tailscale, iOS, and Android.
-2. **Test interactions first, pin second**: opens in **Interact** mode (`pointer-events: none` overlay) so tabs, modals, drawers, and drag gestures work naturally; switch to **Drop pins** or **Box region** anytime (or `Option`/`Alt` + click to trigger buttons while pinning).
-3. **Semantic element capture**: extracts `data-screen`, `data-part`, accessible labels, short CSS selectors, and exact percentage coordinates—keeping pins anchored even inside scrollable or dynamically re-rendered containers.
-4. **One-click agent handoff**: saves `.annotations.json` + `.annotations.md` sidecars next to the prototype (auto-restoring drafts on reopen) and dispatches structured Markdown feedback straight into your active Paseo agent session.
+1. **Zero-port encrypted transport**: reads `.html`/`.htm` on the daemon host, inlines relative `<link rel="stylesheet">` and `<img>` assets automatically (up to 64 MB bundled total), and streams large prototypes in 1.5 MB chunks—works seamlessly over Desktop, Web, Paseo Relay, Cloudflare Tunnel, Tailscale, iOS, and Android.
+2. **Test interactions first, pin second**: opens in **Interact** mode (`pointer-events: none` overlay) so tabs, modals, drawers, inner scroll lists, and vertical swipe feeds work naturally; switch to **Drop pins** or **Box region** anytime (or `Option`/`Alt` + click to trigger buttons while pinning).
+3. **Semantic element capture**: extracts `data-screen`, `data-part`, DOM ancestor path, visible text snippet, short CSS selectors, and exact percentage coordinates—keeping pins anchored inside scrollable or dynamically switched screens across both desktop and full-stage (`100vh`) mobile viewports.
+4. **One-click `<prototype-feedback>` handoff**: saves `.annotations.json` + `.annotations.md` sidecars next to the prototype, deduplicates previously sent pins on follow-up rounds, renders a collapsible feedback card right in the chat timeline, and dispatches structured `<prototype-feedback>` straight into your active Paseo agent session.
 
 ![End-to-End Review Workflow](./assets/workflow-overview.png)
 

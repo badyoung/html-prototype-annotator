@@ -54,6 +54,17 @@
     "downloadA11y": "Download HTML prototype {{name}}",
     "downloadFailed": "Download failed: {{error}}"
   },
+  "feedback": {
+    "approvedTitle": "Prototype Approved · {{name}}",
+    "changesTitle": "Prototype Feedback · {{name}}",
+    "approvedSubtitle": "Approved as-is · Proceed with implementation",
+    "changesSubtitle": "{{count}} annotations",
+    "changesWithScreens": "{{count}} annotations · {{screens}} screens",
+    "reopenBtn": "Open",
+    "expandMore": "Show {{count}} more annotations",
+    "collapseList": "Collapse list",
+    "overallLabel": "Overall note"
+  },
   "save": {
     "startedDownload": "Downloading {{name}} ({{size}})",
     "openedShare": "Opened share sheet: {{name}}"
@@ -116,6 +127,8 @@
     "toastSubmitFailed": "Submit failed: {{error}}",
     "toastCopied": "Copied Markdown feedback",
     "toastCopyFailed": "Failed to copy to clipboard",
-    "toastInteractFailed": "Interaction failed: {{error}}"
+    "toastInteractFailed": "Interaction failed: {{error}}",
+    "sentBadge": "Sent",
+    "clearSent": "Clear sent"
   }
 }

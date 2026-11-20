@@ -50,6 +50,6 @@ Prototype Annotator opens in **Interact** mode (`pointer-events: none` overlay) 
 
 ## Acting on returned Prototype Annotator feedback
 
-When the user sends back a `📌 HTML Prototype Annotations` message:
-1. Match each numbered item (`#1 [Screen] Part (pin x%, y% · selector)`) directly to its `data-screen` and `data-part` in the prototype or target production component.
-2. Address every listed pin and the overall note systematically—either updating the prototype for another round or applying the approved design into production code as instructed.
+When the user sends back a `<prototype-feedback>` (or `📌 HTML Prototype Annotations`) message:
+1. Match each numbered item (`#1 [Screen] Part (pin x%, y% · selector)`, plus optional `DOM:` path and `Text:` snippet) directly to its `data-screen` and `data-part` in the prototype or target production component.
+2. If `status="approved"` with zero revision items, proceed to production implementation; otherwise address every listed pin and the overall note systematically—either updating the prototype for another round or applying the requested revisions into production code as instructed.
